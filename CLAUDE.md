@@ -5,8 +5,10 @@ PostgreSQL backend, Vue 3 + Element Plus UI (ru/en), worker with a PostgreSQL ta
 (PowerShell scripts), VM console through guacd (RDP vmconnect :2179), virtual routers (Debian 13 VMs with nftables,
 VRF, DHCP) configured over SSH.
 
-**Read [HANDOVER.md](HANDOVER.md) first** — project state, what was never run against real Hyper-V, the live-cluster
-test plan and the debugging workflow. Docs: README.md, docs/hyperv-setup.md, docs/routers.md.
+**Read [HANDOVER.md](HANDOVER.md) first** — project state, what was never run against real Hyper-V and the debugging
+workflow. The step-by-step live-cluster test plan (Debian 13 + Claude Code) is
+[docs/live-test-plan.md](docs/live-test-plan.md); record results in `docs/live-test-results.md` (template at its end).
+Docs: README.md, docs/hyperv-setup.md, docs/routers.md.
 
 ## Commands
 
