@@ -44,6 +44,7 @@ function Get-HvdVmSummary($vm) {
         uptime_s           = [int64]$vm.Uptime.TotalSeconds
         clustered          = [bool]$vm.IsClustered
         ips                = (Get-HvdVmIps $vm)
+        nics               = @(foreach ($a in @($vm.NetworkAdapters)) { @{ name = [string]$a.Name; mac = [string]$a.MacAddress } })
         host               = $env:COMPUTERNAME
     }
 }

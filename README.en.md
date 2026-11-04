@@ -30,7 +30,8 @@ images, take snapshots and open VM consoles in the browser.
   browser; one-time tickets.
 * **Virtual routers (Edge)**: a Debian 13 VM per organization installed unattended from the provider ISO;
   management in the global table (SSH from HV Director), WAN and tenant networks in a VRF, networks attached
-  as VLAN SVIs on a trunk; stateful/stateless firewall, SNAT/DNAT, IP sets, explicit TCP/UDP ports.
+  as VLAN SVIs on a trunk; stateful/stateless firewall, SNAT/DNAT, IP sets, explicit TCP/UDP ports;
+  DHCP server per connected network (pool, DNS/NTP/domain, static bindings, live view of the leases).
   See [docs/routers.md](docs/routers.md) (Russian).
 * **UI in Russian and English**, task panel and audit log.
 * **Everything on one Debian 13 machine without Docker**; host addresses and credentials live in

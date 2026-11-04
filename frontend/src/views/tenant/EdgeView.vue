@@ -173,6 +173,11 @@
           </el-table>
         </el-tab-pane>
 
+        <!-- DHCP -->
+        <el-tab-pane :label="t('edge.dhcp.tab')" name="dhcp" lazy>
+          <EdgeDhcp ref="dhcpRef" :can-manage="canManage" :ready="info.router.status === 'ready'" @changed="load(overviewDirty)" />
+        </el-tab-pane>
+
         <!-- IP sets -->
         <el-tab-pane :label="`${t('edge.ipsets')} (${ipsets.length})`" name="ipsets">
           <div class="toolbar">
@@ -319,7 +324,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../../api'
@@ -327,6 +332,7 @@ import { errorText } from '../../i18n'
 import { useAuth } from '../../stores/auth'
 import { useTasks } from '../../stores/tasks'
 import AddressPicker from '../../components/AddressPicker.vue'
+import EdgeDhcp from '../../components/EdgeDhcp.vue'
 import { fmtGb, fmtMb, stateText } from '../../utils/format'
 
 const { t } = useI18n()
@@ -340,6 +346,9 @@ const ipsets = ref([])
 const extIps = ref([])
 const classes = ref([])
 const tab = ref('overview')
+const dhcpRef = ref(null)
+// connected networks may have changed on the overview tab
+watch(tab, (v) => { if (v === 'dhcp') dhcpRef.value?.load() })
 const edit = reactive({ network_ids: [], firewall_stateful: true, firewall_default_action: 'drop', firewall_log_default: false })
 const canManage = computed(() => auth.can('router.manage'))
 const busy = computed(() => {

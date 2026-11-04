@@ -181,6 +181,105 @@ def test_03_rules_and_apply(env):
     env["ext"] = ext
 
 
+def _vl(name: str) -> str:
+    return open(os.path.join(_router_files("198.51.100.10"), "network", name)).read()
+
+
+def test_03b_dhcp(env):
+    t = env["t"]
+    nets = t.get("/api/tenant/router/dhcp").json()
+    assert [n["network"]["name"] for n in nets] == ["web", "db"]
+    web = nets[0]
+    assert web["dhcp"] is None and web["bindings"] == []
+    assert web["suggested"] == {"range_start": "10.20.0.128", "range_end": "10.20.0.254"}
+    url = f"/api/tenant/router/dhcp/{env['web']}"
+    body = {"range_start": "10.20.0.100", "range_end": "10.20.0.199", "lease_time": 3600,
+            "dns_servers": ["10.20.0.53", "1.1.1.1"], "domain_name": "corp.example"}
+    for patch, code in (({"range_start": "10.20.0.1"}, "dhcp_range_gateway"),
+                        ({"range_end": "10.21.0.10"}, "ip_not_in_network"),
+                        ({"lease_time": 10}, "invalid_lease_time"),
+                        ({"domain_name": "bad domain"}, "invalid_domain_name"),
+                        ({"dns_servers": ["10.20.0.53"] * 2 + ["1.0.0.1", "1.0.0.2", "1.0.0.3", "1.0.0.4"]},
+                         "too_many_servers")):
+        r = t.put(url, json=dict(body, **patch))
+        assert r.status_code in (400, 409) and r.json()["detail"]["code"] == code, (patch, r.text)
+    isolated = t.post("/api/tenant/networks", {"name": "lab", "cidr": "10.20.9.0/24", "gateway": "10.20.9.1"}).json()
+    r = t.put(f"/api/tenant/router/dhcp/{isolated['id']}", json=dict(body, range_start="10.20.9.10",
+                                                                       range_end="10.20.9.20"))
+    assert r.json()["detail"]["code"] == "network_not_on_router"
+    r = t.put(url, json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["dhcp"]["enabled"] and r.json()["dhcp"]["dns_servers"] == ["10.20.0.53", "1.1.1.1"]
+    burl = f"/api/tenant/router/dhcp/{env['web']}/bindings"
+    b = t.post(burl, {"name": "printer", "mac": "00155D0A0B0C", "address": "10.20.0.20"})
+    assert b.status_code == 200 and b.json()["mac"] == "00:15:5d:0a:0b:0c", b.text
+    for patch, code in (({"address": "10.20.0.150"}, "dhcp_binding_in_range"),
+                        ({"mac": "00-15-5D-0A-0B-0C", "address": "10.20.0.30"}, "dhcp_binding_mac_exists"),
+                        ({"mac": "00155D0A0B0D"}, "dhcp_binding_ip_exists"),
+                        ({"mac": "01:00:5e:00:00:01", "address": "10.20.0.31"}, "invalid_mac"),
+                        ({"mac": "00155D0A0B0D", "address": "10.20.0.1"}, "ip_is_gateway")):
+        r = t.post(burl, dict({"name": "x", "mac": "00155D0A0B0C", "address": "10.20.0.20"}, **patch))
+        assert r.json()["detail"]["code"] == code, (patch, r.text)
+    res = run_tasks()
+    assert [x["kind"] for x in res] == ["router.apply"] and res[0]["status"] == "success"
+    conf = _vl("44-hvd-vl300.network")
+    assert "DHCPServer=yes" in conf and "PoolOffset=100\nPoolSize=100\n" in conf
+    assert "DNS=10.20.0.53 1.1.1.1" in conf and "SendOption=15:string:corp.example" in conf
+    assert "MACAddress=00:15:5d:0a:0b:0c\nAddress=10.20.0.20" in conf
+    assert "DHCPServer" not in _vl("44-hvd-vl301.network")
+    nft = open(os.path.join(_router_files("198.51.100.10"), "nftables.conf")).read()
+    assert 'meta sdifname { "vl300" } udp dport 67 accept' in nft
+    assert {n["name"]: n["dhcp"] for n in t.get("/api/tenant/networks").json()} == {
+        "web": True, "db": False, "isolated": False, "lab": False}
+    # the subnet / gateway of the network must keep fitting the DHCP settings
+    r = t.patch(f"/api/tenant/networks/{env['web']}", {"cidr": "10.21.0.0/24", "gateway": "10.21.0.1"})
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "network_dhcp_conflict"
+    assert t.patch(f"/api/tenant/networks/{env['web']}", {"gateway": "10.20.0.150"}).json()["detail"][
+        "code"] == "network_dhcp_conflict"
+
+    # a running VM in the network gets a lease; the lease is matched to the VM by MAC
+    vm = t.post("/api/tenant/vms", {"name": "app01", "vcpu": 1, "memory_mb": 1024, "power_on": True,
+                                    "disks": [{"size_gb": 10, "storage_class_id": env["sc"]}],
+                                    "nics": [{"network_id": env["web"]}]})
+    assert vm.status_code == 200, vm.text
+    assert run_tasks()[-1]["status"] == "success"
+    vm = t.get(f"/api/tenant/vms/{vm.json()['vm']['id']}").json()
+    mac = vm["nics"][0]["mac"]
+    [web_nics] = [n["vm_nics"] for n in t.get("/api/tenant/router/dhcp").json() if n["network"]["name"] == "web"]
+    assert web_nics == [{"vm_id": vm["id"], "vm": "app01", "nic": "nic0",
+                         "mac": ":".join(mac[i:i + 2] for i in range(0, 12, 2)).lower()}]
+    leases = t.get("/api/tenant/router/dhcp/leases").json()["leases"]
+    assert [(x["address"], x["vm"], x["binding"], x["network"]) for x in leases] == [
+        ("10.20.0.100", "app01", None, "web")]
+    assert leases[0]["mac"] == ":".join(mac[i:i + 2] for i in range(0, 12, 2)).lower()
+    assert leases[0]["hostname"] == "app01" and leases[0]["expires_in"] > 0
+    # reserve an address for the VM
+    rb = t.post(burl, {"name": "app01", "mac": mac, "address": "10.20.0.21"}).json()
+    run_tasks()
+    leases = t.get("/api/tenant/router/dhcp/leases").json()["leases"]
+    assert [(x["address"], x["vm"], x["binding"]) for x in leases] == [("10.20.0.21", "app01", "app01")]
+    upd = t.patch(f"/api/tenant/router/dhcp/bindings/{rb['id']}", {"name": "app01", "mac": mac,
+                                                                    "address": "10.20.0.22"})
+    assert upd.status_code == 200 and upd.json()["address"] == "10.20.0.22"
+    assert t.delete(f"/api/tenant/router/dhcp/bindings/{b.json()['id']}").json() == {"ok": True}
+    run_tasks()
+    conf = _vl("44-hvd-vl300.network")
+    assert "Address=10.20.0.22" in conf and "00:15:5d:0a:0b:0c" not in conf
+    assert [b["name"] for b in t.get("/api/tenant/router/dhcp").json()[0]["bindings"]] == ["app01"]
+    # disable: no DHCP server and no firewall opening on the router
+    r = t.put(url, json=dict(body, enabled=False))
+    assert r.status_code == 200 and r.json()["dhcp"]["enabled"] is False
+    run_tasks()
+    assert "DHCPServer" not in _vl("44-hvd-vl300.network")
+    assert "dport 67" not in open(os.path.join(_router_files("198.51.100.10"), "nftables.conf")).read()
+    assert t.get("/api/tenant/router/dhcp/leases").json()["leases"] == []
+    # clean up: the VM and the extra network (quotas are checked when the router is deleted)
+    assert t.delete(f"/api/tenant/vms/{vm['id']}").status_code == 200
+    run_tasks()
+    assert t.delete(f"/api/tenant/networks/{isolated['id']}").status_code == 200
+    env["web_dhcp_body"] = body
+
+
 def test_04_audit_role_and_provider_view(env):
     t = env["t"]
     t.post("/api/tenant/users", {"username": "eaudit", "password": "Audit12345!", "roles": [{"role": "audit"}]})
@@ -189,6 +288,9 @@ def test_04_audit_role_and_provider_view(env):
     assert a.get("/api/tenant/router").status_code == 200
     assert a.get("/api/tenant/router/firewall").status_code == 200
     assert a.post("/api/tenant/router/firewall", {"name": "x"}).status_code == 403
+    assert a.get("/api/tenant/router/dhcp").status_code == 200
+    assert a.get("/api/tenant/router/dhcp/leases").status_code == 200
+    assert a.put(f"/api/tenant/router/dhcp/{env['web']}", json=env["web_dhcp_body"]).status_code == 403
     prov = env["prov"]
     routers = prov.get("/api/provider/routers").json()
     rt = next(r for r in routers if r["tenant"] == "edgeco")

@@ -18,7 +18,7 @@
       </div>
       <el-table v-loading="loading" :data="items" :empty-text="t('common.noData')">
         <el-table-column :label="t('common.name')" min-width="160">
-          <template #default="{ row }">{{ row.name }} <el-tag v-if="row.on_router" size="small" type="success">{{ t('nav.edge') }}</el-tag></template>
+          <template #default="{ row }">{{ row.name }} <el-tag v-if="row.on_router" size="small" type="success">{{ t('nav.edge') }}</el-tag> <el-tag v-if="row.dhcp" size="small" type="primary">DHCP</el-tag></template>
         </el-table-column>
         <el-table-column prop="vlan_id" label="VLAN" width="90" />
         <el-table-column :label="t('networks.cidr')" width="160"><template #default="{ row }"><span class="mono">{{ row.cidr || '—' }}</span></template></el-table-column>

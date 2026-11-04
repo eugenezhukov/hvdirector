@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import re
 import uuid
 from typing import Any
 
@@ -14,15 +15,14 @@ from sqlalchemy.orm import Session
 from ..config import get_config
 from ..errors import AppError, Conflict, NotFound
 from ..hyperv import HyperVDriver
-from ..models import (VM, ExternalIp, ExternalNetwork, FirewallRule, IpSet, Iso, NatRule, Network, Router, Task,
-                      User, utcnow)
+from ..models import VM, DhcpBinding, ExternalIp, ExternalNetwork, IpSet, Iso, Network, Router, Task, User, utcnow
 from ..security import decrypt_secret, encrypt_secret
 from ..utils import unique_iso_file_name
 from . import netutil
 from .audit import log_event
 from .inventory import endpoint_for, run_on_vm
 from .isostore import IsoStore
-from .routerconf import FwRuleSpec, LanSpec, NatRuleSpec, RouterSpec, WanSpec, render_all
+from .routerconf import DhcpSpec, FwRuleSpec, LanSpec, NatRuleSpec, RouterSpec, WanSpec, render_all
 from .routerprov import InstallSpec, generate_ed25519, installer_files, remaster_iso
 from .routerssh import RouterConn, get_transport
 from .settings import get_setting, set_setting
@@ -36,6 +36,11 @@ ROUTER_VM_NAME = "_edge"  # not a valid tenant VM name, so it never collides
 FW_ACTIONS = ("allow", "drop", "reject")
 FW_PROTOCOLS = ("any", "tcp", "udp", "tcp_udp", "icmp")
 NAT_PROTOCOLS = ("any", "tcp", "udp", "tcp_udp")
+DHCP_LEASE_MIN = 300
+DHCP_LEASE_MAX = 365 * 86400
+DHCP_MAX_SERVERS = 4
+DHCP_MAX_BINDINGS = 1000
+_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +126,8 @@ def build_spec(db: Session, router: Router) -> RouterSpec:
     for rn in sorted(router.networks, key=lambda x: x.network.vlan_id):
         n = rn.network
         net = netutil.parse_cidr(n.cidr, "network")
-        lans.append(LanSpec(vlan=n.vlan_id, address=f"{n.gateway}/{net.prefixlen}", network=str(net), name=n.name))
+        lans.append(LanSpec(vlan=n.vlan_id, address=f"{n.gateway}/{net.prefixlen}", network=str(net), name=n.name,
+                            dhcp=dhcp_spec(n)))
     nets = {str(n.id): n for n in db.scalars(select(Network).where(Network.tenant_id == tenant.id))}
     ipsets = {str(s.id): s for s in db.scalars(select(IpSet).where(IpSet.tenant_id == tenant.id))}
     fw = []
@@ -147,6 +153,16 @@ def build_spec(db: Session, router: Router) -> RouterSpec:
         mgmt_dns=_dns_list(mgmt.network.dns), mgmt_allowed=_allowed_mgmt(settings), wan=wan, lans=lans,
         stateful=router.firewall_stateful, default_action=router.firewall_default_action,
         log_default=router.firewall_log_default, fw_rules=fw, nat_rules=nat)
+
+
+def dhcp_spec(n: Network) -> DhcpSpec | None:
+    d = n.dhcp
+    if d is None or not d.enabled:
+        return None
+    bindings = sorted(n.dhcp_bindings, key=lambda b: ipaddress.IPv4Address(b.address))
+    return DhcpSpec(range_start=d.range_start, range_end=d.range_end, lease_time=d.lease_time,
+                    dns=list(d.dns_servers), ntp=list(d.ntp_servers), domain=d.domain_name,
+                    static_leases=[(b.mac, b.address) for b in bindings])
 
 
 def install_spec(db: Session, router: Router) -> InstallSpec:
@@ -295,6 +311,135 @@ def validate_ipset_entries(entries: list[str]) -> list[str]:
     if len(clean) > 500:
         raise AppError("too_many_addresses", "Too many entries", max=500)
     return clean
+
+
+def normalize_mac(value: str | None) -> str:
+    """"00155D0A0B0C", "00-15-5D-0A-0B-0C", "0015.5d0a.0b0c" -> "00:15:5d:0a:0b:0c" (unicast only)."""
+    raw = re.sub(r"[\s:.\-]", "", str(value or "")).lower()
+    if not re.fullmatch(r"[0-9a-f]{12}", raw) or raw == "0" * 12 or int(raw[:2], 16) & 1:
+        raise AppError("invalid_mac", f"Invalid MAC address: {value}", value=str(value or ""))
+    return ":".join(raw[i:i + 2] for i in range(0, 12, 2))
+
+
+def _server_list(values: list[str] | None, field: str) -> list[str]:
+    out: list[str] = []
+    for v in values or []:
+        v = str(v).strip()
+        if not v:
+            continue
+        ip = netutil.parse_ip(v, field)
+        if ip.is_unspecified or ip.is_multicast or ip.is_loopback or ip == ipaddress.IPv4Address("255.255.255.255"):
+            raise AppError("invalid_ip", f"Invalid server address: {v}", value=v, field=field)
+        if str(ip) not in out:
+            out.append(str(ip))
+    if len(out) > DHCP_MAX_SERVERS:
+        raise AppError("too_many_servers", "Too many servers", max=DHCP_MAX_SERVERS)
+    return out
+
+
+def dhcp_range_suggestion(n: Network) -> tuple[str, str] | None:
+    """Default pool for a new DHCP configuration: upper half of the subnet, without the gateway."""
+    if not n.cidr:
+        return None
+    net = ipaddress.IPv4Network(n.cidr)
+    first, last = int(net.network_address) + 1, int(net.broadcast_address) - 1
+    start, end = first + (last - first + 1) // 2, last
+    gw = int(ipaddress.IPv4Address(n.gateway)) if n.gateway else None
+    if gw is not None and start <= gw <= end:
+        if gw == end:
+            end -= 1
+        else:
+            start = gw + 1
+    if start > end:
+        return None
+    return str(ipaddress.IPv4Address(start)), str(ipaddress.IPv4Address(end))
+
+
+def _check_binding_address(b: DhcpBinding, gateway: ipaddress.IPv4Address, net: ipaddress.IPv4Network,
+                           start: ipaddress.IPv4Address | None, end: ipaddress.IPv4Address | None) -> None:
+    ip = ipaddress.IPv4Address(b.address)
+    if ip not in net or ip == gateway or (net.prefixlen < 31 and ip in (net.network_address, net.broadcast_address)):
+        raise Conflict("dhcp_binding_outside", "Static binding is not a usable address of the network",
+                       name=b.name, value=b.address, network=str(net))
+    if start is not None and end is not None and start <= ip <= end:
+        raise Conflict("dhcp_binding_in_range", "Static bindings must be outside the DHCP range",
+                       name=b.name, value=b.address, range=f"{start}-{end}")
+
+
+def validate_dhcp(n: Network, data: dict[str, Any]) -> dict[str, Any]:
+    """DHCP settings of a network: pool inside the subnet without the gateway, bindings outside the pool."""
+    if not n.cidr or not n.gateway:
+        raise AppError("network_needs_gateway", "Set the subnet (CIDR) and gateway of the network first",
+                       network=n.name)
+    gateway, net = netutil.parse_interface(n.gateway, n.cidr)
+    start, _ = netutil.parse_interface(str(data.get("range_start") or ""), n.cidr)
+    end, _ = netutil.parse_interface(str(data.get("range_end") or ""), n.cidr)
+    if end < start:
+        raise AppError("invalid_range", f"Invalid range {start}-{end}", value=f"{start}-{end}")
+    if start <= gateway <= end:
+        raise AppError("dhcp_range_gateway", "The DHCP range must not include the gateway", gateway=str(gateway))
+    try:
+        lease_time = int(data.get("lease_time") or 86400)
+    except (TypeError, ValueError):
+        lease_time = 0
+    if not DHCP_LEASE_MIN <= lease_time <= DHCP_LEASE_MAX:
+        raise AppError("invalid_lease_time", "Lease time must be between 5 minutes and 365 days",
+                       min=DHCP_LEASE_MIN, max=DHCP_LEASE_MAX)
+    domain = str(data.get("domain_name") or "").strip().rstrip(".").lower()
+    if domain and not _DOMAIN_RE.match(domain):
+        raise AppError("invalid_domain_name", f"Invalid domain name: {domain}", value=domain)
+    for b in n.dhcp_bindings:
+        _check_binding_address(b, gateway, net, start, end)
+    return {"enabled": bool(data.get("enabled", True)), "range_start": str(start), "range_end": str(end),
+            "lease_time": lease_time, "dns_servers": _server_list(data.get("dns_servers"), "dns_servers"),
+            "ntp_servers": _server_list(data.get("ntp_servers"), "ntp_servers"), "domain_name": domain}
+
+
+def revalidate_network_dhcp(n: Network) -> None:
+    """After a subnet / gateway change: the stored DHCP pool and bindings must still fit."""
+    if n.dhcp is None and not n.dhcp_bindings:
+        return
+    try:
+        if n.dhcp is not None:
+            validate_dhcp(n, {"enabled": n.dhcp.enabled, "range_start": n.dhcp.range_start,
+                              "range_end": n.dhcp.range_end, "lease_time": n.dhcp.lease_time,
+                              "domain_name": n.dhcp.domain_name})
+        elif not n.cidr or not n.gateway:
+            raise AppError("network_needs_gateway", "The network has static DHCP bindings")
+        else:
+            gateway, net = netutil.parse_interface(n.gateway, n.cidr)
+            for b in n.dhcp_bindings:
+                _check_binding_address(b, gateway, net, None, None)
+    except AppError as exc:
+        raise Conflict("network_dhcp_conflict", "The subnet or gateway conflicts with the DHCP settings of the network",
+                       network=n.name, detail=exc.message) from exc
+
+
+def validate_dhcp_binding(n: Network, data: dict[str, Any], binding_id: uuid.UUID | None = None) -> dict[str, Any]:
+    name = (data.get("name") or "").strip()
+    if not name or len(name) > 64:
+        raise AppError("invalid_binding_name", "Binding name is required (up to 64 characters)")
+    mac = normalize_mac(data.get("mac"))
+    if not n.cidr or not n.gateway:
+        raise AppError("network_needs_gateway", "Set the subnet (CIDR) and gateway of the network first",
+                       network=n.name)
+    ip, net = netutil.parse_interface(str(data.get("address") or ""), n.cidr)
+    if ip == ipaddress.IPv4Address(n.gateway):
+        raise AppError("ip_is_gateway", "The address is the gateway of the network", address=str(ip))
+    d = n.dhcp
+    if d is not None and ipaddress.IPv4Address(d.range_start) <= ip <= ipaddress.IPv4Address(d.range_end):
+        raise AppError("dhcp_binding_in_range", "Static bindings must be outside the DHCP range",
+                       name=name, value=str(ip), range=f"{d.range_start}-{d.range_end}")
+    others = [b for b in n.dhcp_bindings if b.id != binding_id]
+    for b in others:
+        if b.mac == mac:
+            raise Conflict("dhcp_binding_mac_exists", "A binding for this MAC address already exists",
+                           mac=mac, name=b.name)
+        if b.address == str(ip):
+            raise Conflict("dhcp_binding_ip_exists", "This address is already reserved", value=str(ip), name=b.name)
+    if len(others) >= DHCP_MAX_BINDINGS:
+        raise AppError("too_many_bindings", "Too many static bindings", max=DHCP_MAX_BINDINGS)
+    return {"name": name, "mac": mac, "address": str(ip), "description": (data.get("description") or "")[:1000]}
 
 
 def rules_referencing(db: Session, tenant_id: uuid.UUID, kind: str, value: str) -> list[str]:
@@ -538,6 +683,7 @@ def router_delete_failed(db: Session, driver: HyperVDriver, task: Task, exc: Exc
         router.status_message = str(exc)[:4000]
 
 
-__all__ = ["ERROR_HOOKS", "ROUTER_VM_NAME", "apply_router", "bump", "bump_tenant", "build_spec", "ensure_keypair",
-           "tenant_mgmt_ip", "tenant_wan", "validate_fw_rule", "validate_nat_rule", "validate_ipset_entries",
+__all__ = ["ERROR_HOOKS", "ROUTER_VM_NAME", "apply_router", "bump", "bump_tenant", "build_spec", "dhcp_range_suggestion",
+           "dhcp_spec", "ensure_keypair", "normalize_mac", "revalidate_network_dhcp", "tenant_mgmt_ip", "tenant_wan",
+           "validate_dhcp", "validate_dhcp_binding", "validate_fw_rule", "validate_nat_rule", "validate_ipset_entries",
            "validate_networks_for_router", "rules_referencing", "VM"]

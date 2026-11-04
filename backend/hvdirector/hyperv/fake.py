@@ -241,6 +241,7 @@ class FakeDriver(HyperVDriver):
             "clustered": vm.get("clustered", False),
             "ips": [f"192.168.{vm['nics'][0]['vlan'] % 250}.{10 + int(vm['id'][:2], 16) % 200}"]
             if running and vm["nics"] and vm["nics"][0].get("vlan") else [],
+            "nics": [{"name": n["name"], "mac": n["mac"]} for n in vm["nics"]],
             "host": vm["host"],
         }
 

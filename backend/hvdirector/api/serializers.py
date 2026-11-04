@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 from typing import Any
 
 from ..models import VM, Cluster, Datastore, Event, Host, Iso, Network, Snapshot, StorageClass, Tenant, User
@@ -81,7 +82,7 @@ def tenant_to_dict(t: Tenant, extra: dict[str, Any] | None = None) -> dict[str, 
 def network_to_dict(n: Network, nic_count: int = 0, on_router: bool = False) -> dict[str, Any]:
     return {"id": str(n.id), "name": n.name, "vlan_id": n.vlan_id, "description": n.description, "cidr": n.cidr,
             "gateway": n.gateway, "dns": n.dns, "nic_count": nic_count, "on_router": on_router,
-            "created_at": _iso(n.created_at)}
+            "dhcp": bool(on_router and n.dhcp is not None and n.dhcp.enabled), "created_at": _iso(n.created_at)}
 
 
 def iso_to_dict(i: Iso) -> dict[str, Any]:
@@ -215,3 +216,29 @@ def router_to_dict(r, provider: bool = False, wan: dict[str, Any] | None = None)
         out["vm"] = out["vm"] and {**out["vm"], "hv_name": vm.hv_name, "host": vm.host.name if vm.host else None,
                                    "cluster": vm.cluster.name if vm.cluster else None, "hv_id": vm.hv_id}
     return out
+
+
+def dhcp_binding_to_dict(b) -> dict[str, Any]:  # noqa: ANN001
+    return {"id": str(b.id), "network_id": str(b.network_id), "name": b.name, "mac": b.mac, "address": b.address,
+            "description": b.description, "created_at": _iso(b.created_at)}
+
+
+def dhcp_to_dict(d) -> dict[str, Any] | None:  # noqa: ANN001
+    if d is None:
+        return None
+    return {"enabled": d.enabled, "range_start": d.range_start, "range_end": d.range_end, "lease_time": d.lease_time,
+            "dns_servers": list(d.dns_servers or []), "ntp_servers": list(d.ntp_servers or []),
+            "domain_name": d.domain_name, "updated_at": _iso(d.updated_at)}
+
+
+def dhcp_network_to_dict(n: Network, suggestion: tuple[str, str] | None = None,
+                         vm_nics: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    bindings = sorted(n.dhcp_bindings, key=lambda b: ipaddress.IPv4Address(b.address))
+    return {
+        "network": {"id": str(n.id), "name": n.name, "vlan_id": n.vlan_id, "cidr": n.cidr, "gateway": n.gateway,
+                    "dns": n.dns},
+        "dhcp": dhcp_to_dict(n.dhcp),
+        "suggested": {"range_start": suggestion[0], "range_end": suggestion[1]} if suggestion else None,
+        "bindings": [dhcp_binding_to_dict(b) for b in bindings],
+        "vm_nics": vm_nics or [],
+    }

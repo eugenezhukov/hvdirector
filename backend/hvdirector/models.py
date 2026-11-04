@@ -245,6 +245,11 @@ class Network(Base):
     dns: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[dt.datetime] = _created()
 
+    dhcp: Mapped[NetworkDhcp | None] = relationship(back_populates="network", cascade="all, delete-orphan",
+                                                    passive_deletes=True)
+    dhcp_bindings: Mapped[list[DhcpBinding]] = relationship(back_populates="network", cascade="all, delete-orphan",
+                                                            passive_deletes=True)
+
     __table_args__ = (Index("ux_networks_tenant_name", "tenant_id", func.lower(text("name")), unique=True),)
 
 
@@ -681,4 +686,47 @@ class NatRule(Base):
     __table_args__ = (
         CheckConstraint("kind in ('snat','dnat')", name="ck_nat_kind"),
         CheckConstraint("protocol in ('any','tcp','udp','tcp_udp')", name="ck_nat_protocol"),
+    )
+
+
+class NetworkDhcp(Base):
+    """DHCP server of a tenant network, served by the router on the network SVI (systemd-networkd)."""
+
+    __tablename__ = "network_dhcp"
+
+    network_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("networks.id", ondelete="CASCADE"), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    range_start: Mapped[str] = mapped_column(String(64), nullable=False)
+    range_end: Mapped[str] = mapped_column(String(64), nullable=False)
+    lease_time: Mapped[int] = mapped_column(Integer, default=86400, nullable=False)  # seconds
+    dns_servers: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    ntp_servers: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    domain_name: Mapped[str] = mapped_column(String(253), default="", nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, server_default=func.now(), nullable=False
+    )
+
+    network: Mapped[Network] = relationship(back_populates="dhcp")
+
+    __table_args__ = (CheckConstraint("lease_time between 300 and 31536000", name="ck_dhcp_lease_time"),)
+
+
+class DhcpBinding(Base):
+    """Static DHCP binding (reservation): fixed IPv4 address for a MAC address."""
+
+    __tablename__ = "dhcp_bindings"
+
+    id: Mapped[uuid.UUID] = _pk()
+    network_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("networks.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    mac: Mapped[str] = mapped_column(String(17), nullable=False)  # aa:bb:cc:dd:ee:ff
+    address: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[dt.datetime] = _created()
+
+    network: Mapped[Network] = relationship(back_populates="dhcp_bindings")
+
+    __table_args__ = (
+        Index("ux_dhcp_bindings_mac", "network_id", "mac", unique=True),
+        Index("ux_dhcp_bindings_address", "network_id", "address", unique=True),
     )

@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from ..db import get_db
 from ..errors import AppError, Conflict, Forbidden, NotFound
@@ -465,7 +465,8 @@ class NetworkUpdateIn(BaseModel):
 @router.get("/networks")
 def list_networks(p: Principal = Depends(tenant_user), db: Session = Depends(get_db)) -> list[dict]:
     require_tenant_perm(p, "network.view")
-    rows = db.scalars(select(Network).where(Network.tenant_id == p.tenant_id).order_by(Network.name)).all()
+    rows = db.scalars(select(Network).where(Network.tenant_id == p.tenant_id).options(selectinload(Network.dhcp))
+                      .order_by(Network.name)).all()
     counts = dict(db.execute(select(VMNic.network_id, func.count(VMNic.id)).where(
         VMNic.network_id.in_([n.id for n in rows] or [uuid.uuid4()])).group_by(VMNic.network_id)).all())
     routed = set(db.scalars(select(RouterNetwork.network_id).join(Router, Router.id == RouterNetwork.router_id)
@@ -542,6 +543,7 @@ def update_network(net_id: uuid.UUID, body: NetworkUpdateIn, p: Principal = Depe
             raise AppError("network_needs_gateway", "Set the subnet (CIDR) together with the gateway",
                            network=net.name)
         netutil.parse_interface(net.gateway, net.cidr)
+    rsvc.revalidate_network_dhcp(net)
     r = db.scalar(select(Router).where(Router.tenant_id == p.tenant_id))
     if r is not None and any(rn.network_id == net.id for rn in r.networks):
         db.flush()

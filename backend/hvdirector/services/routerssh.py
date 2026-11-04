@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import base64
 import io
+import ipaddress
+import json
 import logging
 import os
 import posixpath
@@ -15,9 +17,11 @@ import shlex
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from ..config import get_config
 from ..errors import AppError
+from .routerconf import leases_command, mac_colon
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +42,10 @@ class RouterTransport:
         raise NotImplementedError
 
     def apply(self, conn: RouterConn, files: dict[str, str]) -> str:
+        raise NotImplementedError
+
+    def dhcp_leases(self, conn: RouterConn, ifnames: list[str]) -> str:
+        """Raw output of routerconf.leases_command() for the given SVIs (parsed by routerconf.parse_leases)."""
         raise NotImplementedError
 
 
@@ -67,6 +75,23 @@ class SshTransport(RouterTransport):
         code = stdout.channel.recv_exit_status()
         return code, (out + err).strip()
 
+    def exec(self, conn: RouterConn, command: str, timeout: int = 30) -> tuple[int, str]:
+        try:
+            client = self._client(conn, timeout=10)
+        except Exception as exc:  # noqa: BLE001
+            raise AppError("router_unreachable", f"Cannot connect to router {conn.host} over SSH: {exc}",
+                           message=f"{conn.host}: {exc}"[:300]) from exc
+        try:
+            return self._run(client, command, timeout)
+        except Exception as exc:  # noqa: BLE001
+            raise AppError("router_unreachable", f"Router {conn.host} did not answer: {exc}",
+                           message=f"{conn.host}: {exc}"[:300]) from exc
+        finally:
+            client.close()
+
+    def dhcp_leases(self, conn: RouterConn, ifnames: list[str]) -> str:
+        return self.exec(conn, leases_command(ifnames))[1]
+
     def wait_ready(self, conn: RouterConn, timeout_s: int, progress: Callable[[str], None] | None = None) -> None:
         deadline = time.monotonic() + timeout_s
         started = time.monotonic()
@@ -94,12 +119,13 @@ class SshTransport(RouterTransport):
         try:
             client = self._client(conn, timeout=15)
         except Exception as exc:  # noqa: BLE001
-            raise AppError("router_unreachable", f"Cannot connect to router {conn.host} over SSH: {exc}") from exc
+            raise AppError("router_unreachable", f"Cannot connect to router {conn.host} over SSH: {exc}",
+                           message=f"{conn.host}: {exc}"[:300]) from exc
         try:
             dirs = sorted({posixpath.dirname(posixpath.join(stage, p)) for p in files})
             code, out = self._run(client, "mkdir -p " + " ".join(shlex.quote(d) for d in dirs))
             if code != 0:
-                raise AppError("router_apply_failed", f"Cannot create staging directory: {out}")
+                raise AppError("router_apply_failed", f"Cannot create staging directory: {out}", message=out[-300:])
             sftp = client.open_sftp()
             try:
                 for path, content in files.items():
@@ -111,19 +137,26 @@ class SshTransport(RouterTransport):
                    f"/usr/local/sbin/hvd-apply {stage}; rc=$?; rm -rf {stage}; exit $rc")
             code, out = self._run(client, cmd)
             if code != 0 or "HVD-APPLY-OK" not in out:
-                raise AppError("router_apply_failed", f"Router rejected the configuration: {out[-1500:]}")
+                raise AppError("router_apply_failed", f"Router rejected the configuration: {out[-1500:]}",
+                               message=out[-300:])
             return out
         finally:
             client.close()
 
 
 class FakeTransport(RouterTransport):
-    """Simulated router (HVD_HYPERV_DRIVER=fake): stores pushed files locally."""
+    """Simulated router (HVD_HYPERV_DRIVER=fake): stores pushed files locally.
+
+    DHCP leases are simulated from the applied configuration and the simulated
+    Hyper-V state: running VMs with an adapter in the VLAN of a DHCP-enabled SVI
+    hold a lease (their static binding, otherwise the next pool address).
+    """
 
     name = "fake"
 
-    def __init__(self, base_dir: str) -> None:
+    def __init__(self, base_dir: str, hyperv_state_file: str | None = None) -> None:
         self.base_dir = base_dir
+        self.hyperv_state_file = hyperv_state_file
 
     def wait_ready(self, conn: RouterConn, timeout_s: int, progress: Callable[[str], None] | None = None) -> None:
         if progress:
@@ -139,9 +172,80 @@ class FakeTransport(RouterTransport):
                 fh.write(content)
         return "HVD-APPLY-OK (simulated)"
 
+    def _running_nics(self) -> list[tuple[str, dict[str, Any]]]:
+        try:
+            with open(self.hyperv_state_file or "", encoding="utf-8") as fh:
+                vms = json.load(fh).get("vms", {})
+        except (OSError, ValueError):
+            return []
+        return [(vm["name"], nic) for vm in sorted(vms.values(), key=lambda v: v["name"])
+                if vm.get("state") == "Running" for nic in vm.get("nics", [])
+                if (nic.get("mode") or "access") == "access" and nic.get("connected", True) is not False]
+
+    def dhcp_leases(self, conn: RouterConn, ifnames: list[str]) -> str:
+        uptime = 100000
+        nics = self._running_nics()
+        out: list[str] = []
+        for ifname in ifnames:
+            link: dict[str, Any] = {"Name": ifname}
+            path = os.path.join(self.base_dir, conn.host, "network", f"44-hvd-{ifname}.network")
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    server = _fake_dhcp_server(fh.read(), int(ifname[2:]), nics, uptime)
+            except (OSError, ValueError):
+                server = None
+            if server is not None:
+                link["DHCPServer"] = server
+            out += [f"##HVD-IF {ifname}", "##HVD-JSON", json.dumps(link), "##HVD-TEXT"]
+        out.append(f"##HVD-CLOCK {uptime} {int(time.time())}")
+        return "\n".join(out) + "\n"
+
+
+def _networkd_sections(conf: str) -> list[tuple[str, dict[str, str]]]:
+    """systemd unit-file style sections; repeated sections ([DHCPServerStaticLease]) are kept apart."""
+    sections: list[tuple[str, dict[str, str]]] = []
+    for line in conf.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            sections.append((line[1:-1], {}))
+        elif "=" in line and sections:
+            key, value = line.split("=", 1)
+            sections[-1][1][key.strip()] = value.strip()
+    return sections
+
+
+def _fake_dhcp_server(conf: str, vlan: int, nics: list[tuple[str, dict[str, Any]]],
+                      uptime: int) -> dict[str, Any] | None:
+    sections = _networkd_sections(conf)
+    net = dict(sections).get("Network", {})
+    server = dict(sections).get("DHCPServer")
+    if net.get("DHCPServer") != "yes" or server is None:
+        return None
+    subnet = ipaddress.IPv4Interface(net["Address"]).network
+    first = int(subnet.network_address) + int(server.get("PoolOffset", 1))
+    pool = [ipaddress.IPv4Address(first + i) for i in range(int(server.get("PoolSize", 0)))]
+    static = {v["MACAddress"].lower(): v["Address"] for k, v in sections if k == "DHCPServerStaticLease"}
+    expires = (uptime + int(server.get("DefaultLeaseTimeSec", 3600)) * 3 // 4) * 1_000_000
+    leases = []
+    for vm_name, nic in nics:
+        if nic.get("vlan") != vlan or not nic.get("mac"):
+            continue
+        mac = mac_colon(nic["mac"])
+        address = static.get(mac) or (str(pool.pop(0)) if pool else None)
+        if address is None:
+            continue
+        leases.append({"ClientId": [1] + list(bytes.fromhex(mac.replace(":", ""))),
+                       "Address": [int(x) for x in address.split(".")],
+                       "Hostname": vm_name.split("_", 1)[-1], "ExpirationUSec": expires})
+    return {"PoolOffset": int(server.get("PoolOffset", 1)), "PoolSize": int(server.get("PoolSize", 0)),
+            "Leases": leases}
+
 
 def get_transport() -> RouterTransport:
     cfg = get_config()
     if cfg.hyperv_driver == "fake":
-        return FakeTransport(os.path.join(os.path.dirname(os.path.abspath(cfg.fake_state_file)), "fake-routers"))
+        state_dir = os.path.dirname(os.path.abspath(cfg.fake_state_file))
+        return FakeTransport(os.path.join(state_dir, "fake-routers"), cfg.fake_state_file)
     return SshTransport()

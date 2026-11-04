@@ -1,7 +1,8 @@
-"""Tenant API: virtual router (Edge), firewall, NAT, IP sets."""
+"""Tenant API: virtual router (Edge), firewall, NAT, IP sets, DHCP."""
 
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 from typing import Any, Literal
 
@@ -12,19 +13,22 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..errors import AppError, Conflict, NotFound
-from ..models import (VM, Datastore, ExternalIp, FirewallRule, IpSet, NatRule, Network, Router, RouterNetwork,
-                      StorageClass, Task, TenantStorageQuota, VMDisk)
+from ..models import (VM, Datastore, DhcpBinding, ExternalIp, FirewallRule, IpSet, NatRule, Network, NetworkDhcp,
+                      Router, RouterNetwork, StorageClass, Task, TenantStorageQuota, VMDisk, VMNic, utcnow)
 from ..security import encrypt_secret
 from ..services import routers as rsvc
 from ..services.audit import log_event
 from ..services.quotas import Delta, check_quota, lock_tenant
 from ..services.rbac import Principal
+from ..services.routerconf import parse_leases
 from ..services.routerprov import generate_ed25519, random_mac, random_password
+from ..services.routerssh import get_transport
 from ..services.settings import get_setting
 from ..services.taskqueue import enqueue, task_to_dict
 from ..utils import hv_vm_name
 from .deps import require_tenant_perm, tenant_user
-from .serializers import extip_to_dict, fwrule_to_dict, ipset_to_dict, natrule_to_dict, router_to_dict
+from .serializers import (dhcp_binding_to_dict, dhcp_network_to_dict, extip_to_dict, fwrule_to_dict, ipset_to_dict,
+                          natrule_to_dict, router_to_dict)
 
 router = APIRouter(prefix="/api/tenant", tags=["edge"])
 
@@ -486,6 +490,180 @@ def delete_ipset(set_id: uuid.UUID, p: Principal = Depends(tenant_user), db: Ses
         raise Conflict("ipset_in_use", "The IP set is used by firewall rules", rules=", ".join(used))
     log_event(db, "router.ipset.delete", user=p.user, target_type="ip_set", target_name=s.name, ip=p.ip)
     db.delete(s)
+    db.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# DHCP server (per connected network, served by the router on the SVI)
+# ---------------------------------------------------------------------------
+
+
+class DhcpIn(BaseModel):
+    enabled: bool = True
+    range_start: str
+    range_end: str
+    lease_time: int = 86400
+    dns_servers: list[str] = []
+    ntp_servers: list[str] = []
+    domain_name: str = ""
+
+
+class DhcpBindingIn(BaseModel):
+    name: str
+    mac: str
+    address: str
+    description: str = ""
+
+
+def _router_network(db: Session, r: Router, network_id: uuid.UUID) -> Network:
+    n = db.get(Network, network_id)
+    if n is None or n.tenant_id != r.tenant_id:
+        raise NotFound("network")
+    if not any(rn.network_id == n.id for rn in r.networks):
+        raise AppError("network_not_on_router", "Connect the network to the router first", network=n.name)
+    return n
+
+
+def _dhcp_served(r: Router, n: Network) -> bool:
+    return n.dhcp is not None and n.dhcp.enabled and any(rn.network_id == n.id for rn in r.networks)
+
+
+def _get_binding(db: Session, p: Principal, binding_id: uuid.UUID) -> DhcpBinding:
+    b = db.get(DhcpBinding, binding_id)
+    if b is None or b.network.tenant_id != p.tenant_id:
+        raise NotFound("dhcp_binding")
+    return b
+
+
+def _mac_or_none(mac: str | None) -> str | None:
+    try:
+        return rsvc.normalize_mac(mac)
+    except AppError:
+        return None  # dynamic MAC not assigned by Hyper-V yet (000000000000)
+
+
+@router.get("/router/dhcp")
+def list_dhcp(p: Principal = Depends(tenant_user), db: Session = Depends(get_db)) -> list[dict]:
+    """Connected networks with their DHCP settings, static bindings and the VM adapters attached to them."""
+    require_tenant_perm(p, "router.view")
+    r = _get_router(db, p)
+    nets = sorted((rn.network for rn in r.networks), key=lambda n: n.vlan_id)
+    nics: dict[uuid.UUID, list[dict[str, Any]]] = {}
+    rows = db.execute(select(VMNic.network_id, VMNic.hv_name, VMNic.mac, VM.id, VM.name).join(VM, VM.id == VMNic.vm_id)
+                      .where(VM.tenant_id == p.tenant_id, VM.kind == "vm",
+                             VMNic.network_id.in_([n.id for n in nets] or [uuid.uuid4()]))
+                      .order_by(VM.name, VMNic.position)).all()
+    for network_id, nic, mac, vm_id, vm_name in rows:
+        nics.setdefault(network_id, []).append({"vm_id": str(vm_id), "vm": vm_name, "nic": nic,
+                                                "mac": _mac_or_none(mac)})
+    return [dhcp_network_to_dict(n, rsvc.dhcp_range_suggestion(n), nics.get(n.id)) for n in nets]
+
+
+@router.get("/router/dhcp/leases")
+def dhcp_leases(p: Principal = Depends(tenant_user), db: Session = Depends(get_db)) -> dict:
+    """Active leases read live from the router (systemd-networkd) over the management network."""
+    require_tenant_perm(p, "router.view")
+    r = _get_router(db, p)
+    if r.status != "ready" or r.vm is None or not r.vm.hv_id:
+        raise Conflict("router_not_ready", "The router is not deployed yet")
+    nets = {rn.network.vlan_id: rn.network for rn in r.networks if _dhcp_served(r, rn.network)}
+    now = utcnow()
+    if not nets:
+        return {"leases": [], "fetched_at": now.isoformat()}
+    raw = get_transport().dhcp_leases(rsvc.router_conn(db, r), [f"vl{v}" for v in sorted(nets)])
+    vm_by_mac: dict[str, tuple[str, str]] = {}
+    rows = db.execute(select(VMNic.mac, VM.id, VM.name).join(VM, VM.id == VMNic.vm_id)
+                      .where(VM.tenant_id == p.tenant_id, VM.kind == "vm", VMNic.mac.is_not(None))).all()
+    for mac, vm_id, vm_name in rows:
+        if (key := _mac_or_none(mac)) is not None:
+            vm_by_mac[key] = (str(vm_id), vm_name)
+    out = []
+    for lease in parse_leases(raw):
+        n = nets.get(lease["vlan"])
+        if n is None:
+            continue
+        binding = next((b for b in n.dhcp_bindings if b.address == lease["address"]
+                        and (lease["mac"] is None or b.mac == lease["mac"])), None)
+        vm = vm_by_mac.get(lease["mac"] or "")
+        expires_in = lease["expires_in"]
+        out.append({
+            "network_id": str(n.id), "network": n.name, "vlan_id": n.vlan_id, "address": lease["address"],
+            "mac": lease["mac"], "client_id": lease["client_id"], "hostname": lease["hostname"],
+            "expires_in": expires_in,
+            "expires_at": (now + dt.timedelta(seconds=expires_in)).isoformat() if expires_in is not None else None,
+            "binding": binding.name if binding else None, "vm_id": vm[0] if vm else None, "vm": vm[1] if vm else None,
+        })
+    out.sort(key=lambda x: (x["vlan_id"], tuple(int(o) for o in x["address"].split("."))))
+    return {"leases": out, "fetched_at": now.isoformat()}
+
+
+@router.put("/router/dhcp/{network_id}")
+def put_dhcp(network_id: uuid.UUID, body: DhcpIn, p: Principal = Depends(tenant_user),
+             db: Session = Depends(get_db)) -> dict:
+    r = _manage_router(db, p)
+    n = _router_network(db, r, network_id)
+    was_served = _dhcp_served(r, n)
+    data = rsvc.validate_dhcp(n, body.model_dump())
+    if n.dhcp is None:
+        n.dhcp = NetworkDhcp(network_id=n.id, **data)
+    else:
+        for k, v in data.items():
+            setattr(n.dhcp, k, v)
+    if was_served or data["enabled"]:
+        rsvc.bump(db, r, p.user)
+    log_event(db, "router.dhcp.update", user=p.user, target_type="network", target_id=n.id, target_name=n.name,
+              ip=p.ip, details={"enabled": data["enabled"], "range": f"{data['range_start']}-{data['range_end']}"})
+    db.commit()
+    db.refresh(n)
+    return dhcp_network_to_dict(n, rsvc.dhcp_range_suggestion(n))
+
+
+@router.post("/router/dhcp/{network_id}/bindings")
+def create_binding(network_id: uuid.UUID, body: DhcpBindingIn, p: Principal = Depends(tenant_user),
+                   db: Session = Depends(get_db)) -> dict:
+    r = _manage_router(db, p)
+    n = _router_network(db, r, network_id)
+    b = DhcpBinding(network_id=n.id, **rsvc.validate_dhcp_binding(n, body.model_dump()))
+    db.add(b)
+    db.flush()
+    db.expire(n, ["dhcp_bindings"])
+    if _dhcp_served(r, n):
+        rsvc.bump(db, r, p.user)
+    log_event(db, "router.dhcp.binding.create", user=p.user, target_type="network", target_id=n.id,
+              target_name=n.name, ip=p.ip, details={"name": b.name, "mac": b.mac, "address": b.address})
+    db.commit()
+    return dhcp_binding_to_dict(b)
+
+
+@router.patch("/router/dhcp/bindings/{binding_id}")
+def update_binding(binding_id: uuid.UUID, body: DhcpBindingIn, p: Principal = Depends(tenant_user),
+                   db: Session = Depends(get_db)) -> dict:
+    r = _manage_router(db, p)
+    b = _get_binding(db, p, binding_id)
+    n = b.network
+    for k, v in rsvc.validate_dhcp_binding(n, body.model_dump(), binding_id=b.id).items():
+        setattr(b, k, v)
+    if _dhcp_served(r, n):
+        rsvc.bump(db, r, p.user)
+    log_event(db, "router.dhcp.binding.update", user=p.user, target_type="network", target_id=n.id,
+              target_name=n.name, ip=p.ip, details={"name": b.name, "mac": b.mac, "address": b.address})
+    db.commit()
+    return dhcp_binding_to_dict(b)
+
+
+@router.delete("/router/dhcp/bindings/{binding_id}")
+def delete_binding(binding_id: uuid.UUID, p: Principal = Depends(tenant_user), db: Session = Depends(get_db)) -> dict:
+    r = _manage_router(db, p)
+    b = _get_binding(db, p, binding_id)
+    n = b.network
+    log_event(db, "router.dhcp.binding.delete", user=p.user, target_type="network", target_id=n.id,
+              target_name=n.name, ip=p.ip, details={"name": b.name, "mac": b.mac, "address": b.address})
+    db.delete(b)
+    db.flush()
+    db.expire(n, ["dhcp_bindings"])
+    if _dhcp_served(r, n):
+        rsvc.bump(db, r, p.user)
     db.commit()
     return {"ok": True}
 

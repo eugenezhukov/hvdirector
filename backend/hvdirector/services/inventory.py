@@ -7,7 +7,7 @@ import logging
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from ..hyperv import Endpoint, HyperVDriver, HyperVError
 from ..models import VM, Cluster, Datastore, Host, utcnow
@@ -256,13 +256,22 @@ def apply_vm_summary(vm: VM, s: dict[str, Any], host: Host | None) -> None:
     vm.memory_assigned_mb = s.get("memory_assigned_mb")
     vm.uptime_s = s.get("uptime_s")
     vm.guest_ips = list(s.get("ips") or [])
+    if s.get("nics"):
+        # Dynamic MAC addresses are assigned by Hyper-V on the first start (000000000000 before that)
+        # and may change after a migration; DHCP bindings and leases are matched to VMs by MAC.
+        macs = {str(n.get("name")): str(n.get("mac") or "") for n in s["nics"]}
+        for nic in vm.nics:
+            mac = macs.get(nic.hv_name or "", "")
+            if mac.strip("0") and nic.mac != mac:
+                nic.mac = mac
     if host is not None:
         vm.host_id = host.id
     vm.last_sync_at = utcnow()
 
 
 def sync_vms(db: Session, driver: HyperVDriver, cluster: Cluster) -> dict[str, int]:
-    vms = db.scalars(select(VM).where(VM.cluster_id == cluster.id, VM.hv_id.is_not(None))).all()
+    vms = db.scalars(select(VM).where(VM.cluster_id == cluster.id, VM.hv_id.is_not(None))
+                     .options(selectinload(VM.nics))).all()
     by_id = {vm.hv_id.upper(): vm for vm in vms if vm.hv_id}
     if cluster.kind == "cluster":
         states, _, _ = first_reachable(driver, cluster, "node_states")

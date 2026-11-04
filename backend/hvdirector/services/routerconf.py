@@ -16,8 +16,10 @@ input interface.
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 from .netutil import format_ports
 
@@ -33,11 +35,25 @@ class WanSpec:
 
 
 @dataclass
+class DhcpSpec:
+    """DHCP server on a tenant SVI (systemd-networkd built-in server)."""
+
+    range_start: str
+    range_end: str
+    lease_time: int = 86400
+    dns: list[str] = field(default_factory=list)
+    ntp: list[str] = field(default_factory=list)
+    domain: str = ""
+    static_leases: list[tuple[str, str]] = field(default_factory=list)  # (mac "aa:bb:..", ip)
+
+
+@dataclass
 class LanSpec:
     vlan: int
     address: str  # gateway of the tenant network, "10.0.0.1/24"
     network: str  # "10.0.0.0/24"
     name: str = ""
+    dhcp: DhcpSpec | None = None
 
     @property
     def ifname(self) -> str:
@@ -148,10 +164,41 @@ def render_networkd(spec: RouterSpec) -> dict[str, str]:
     files["43-hvd-lan0.network"] = lan0
 
     for lan in spec.lans:
-        files[f"44-hvd-{lan.ifname}.network"] = (
-            f"[Match]\nName={lan.ifname}\n\n[Network]\nVRF={VRF_NAME}\nAddress={lan.address}\n"
-            f"ConfigureWithoutCarrier=yes\n{no_v6}")
+        conf = (f"[Match]\nName={lan.ifname}\n\n[Network]\nVRF={VRF_NAME}\nAddress={lan.address}\n"
+                f"ConfigureWithoutCarrier=yes\n{no_v6}")
+        if lan.dhcp:
+            conf += "DHCPServer=yes\n" + render_dhcp_server(lan)
+        files[f"44-hvd-{lan.ifname}.network"] = conf
     return files
+
+
+def dhcp_pool(network: str, range_start: str, range_end: str) -> tuple[int, int]:
+    """networkd pool: offset from the subnet address and number of addresses."""
+    net = ipaddress.IPv4Network(network)
+    start, end = ipaddress.IPv4Address(range_start), ipaddress.IPv4Address(range_end)
+    return int(start) - int(net.network_address), int(end) - int(start) + 1
+
+
+def render_dhcp_server(lan: LanSpec) -> str:
+    """[DHCPServer] and [DHCPServerStaticLease] sections of the SVI .network file.
+
+    The server address (and the default router handed out) is the SVI address,
+    i.e. the gateway of the tenant network.  Nothing is propagated from the
+    router's own uplinks (UplinkInterface=:none): DNS/NTP are sent only when set.
+    """
+    d = lan.dhcp
+    assert d is not None
+    offset, size = dhcp_pool(lan.network, d.range_start, d.range_end)
+    out = (f"\n[DHCPServer]\nPoolOffset={offset}\nPoolSize={size}\n"
+           f"DefaultLeaseTimeSec={d.lease_time}\nMaxLeaseTimeSec={d.lease_time}\n"
+           "UplinkInterface=:none\nEmitRouter=yes\nEmitTimezone=no\n")
+    out += ("EmitDNS=yes\nDNS=" + " ".join(d.dns) + "\n") if d.dns else "EmitDNS=no\n"
+    out += ("EmitNTP=yes\nNTP=" + " ".join(d.ntp) + "\n") if d.ntp else "EmitNTP=no\n"
+    if d.domain:
+        out += f"SendOption=15:string:{d.domain}\n"
+    for mac, address in d.static_leases:
+        out += f"\n[DHCPServerStaticLease]\nMACAddress={mac_colon(mac)}\nAddress={address}\n"
+    return out
 
 
 def render_sysctl() -> str:
@@ -267,6 +314,13 @@ def render_nftables(spec: RouterSpec) -> str:
         f'        iifname "mgmt0" {mgmt_src}tcp dport 22 accept comment "HV Director management"',
         '        iifname "mgmt0" icmp type echo-request accept',
         '        iifname != "mgmt0" icmp type echo-request limit rate 20/second accept comment "ping router"',
+    ]
+    dhcp_ifs = [lan.ifname for lan in spec.lans if lan.dhcp]
+    if dhcp_ifs:
+        # In the VRF the input hook sees the VRF device as iif; sdifname is the SVI the request came from
+        names = ", ".join(f'"{i}"' for i in dhcp_ifs)
+        out.append(f'        meta sdifname {{ {names} }} udp dport 67 accept comment "DHCP server"')
+    out += [
         "    }",
         "",
         "    chain forward {",
@@ -347,6 +401,166 @@ install -m 0644 "$S/nftables.conf" /etc/nftables.conf
 nft -f /etc/nftables.conf
 echo "HVD-APPLY-OK"
 """
+
+
+# ---------------------------------------------------------------------------
+# DHCP leases: read from systemd-networkd on the router
+# ---------------------------------------------------------------------------
+
+_SVI_RE = re.compile(r"^vl\d{1,4}$")
+_TEXT_LEASE_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}) \(to ([^)]+)\)")
+_MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
+
+
+def leases_command(ifnames: list[str]) -> str:
+    """Shell command printing the DHCP server state of the SVIs (JSON and text form) and the router clocks."""
+    names = " ".join(i for i in ifnames if _SVI_RE.match(i))
+    return (f"for i in {names}; do "
+            'echo "##HVD-IF $i"; echo "##HVD-JSON"; networkctl --no-pager --json=short status "$i" 2>/dev/null; '
+            'echo "##HVD-TEXT"; networkctl --no-pager status "$i" 2>/dev/null; '
+            "done; "
+            'echo "##HVD-CLOCK $(cut -d. -f1 /proc/uptime) $(date +%s)"')
+
+
+def _hex(raw: bytes) -> str:
+    return ":".join(f"{b:02x}" for b in raw)
+
+
+def mac_from_client_id(raw: bytes) -> str | None:
+    """MAC address from a DHCP client identifier: type 1 (Ethernet) or IAID+DUID-LL(T) (RFC 4361)."""
+    if len(raw) == 7 and raw[0] == 1:
+        return _hex(raw[1:])
+    if len(raw) > 5 and raw[0] == 255:
+        duid = raw[5:]
+        if len(duid) >= 4 and int.from_bytes(duid[2:4], "big") == 1:  # hardware type Ethernet
+            dtype = int.from_bytes(duid[0:2], "big")
+            if dtype == 1 and len(duid) == 14:  # DUID-LLT: type, hwtype, time, MAC
+                return _hex(duid[8:14])
+            if dtype == 3 and len(duid) == 10:  # DUID-LL: type, hwtype, MAC
+                return _hex(duid[4:10])
+    return None
+
+
+def _as_bytes(value: Any) -> bytes | None:
+    if isinstance(value, list) and value and all(isinstance(x, int) and 0 <= x <= 255 for x in value):
+        return bytes(value)
+    if isinstance(value, str):
+        h = re.sub(r"[^0-9A-Fa-f]", "", value)
+        if h and len(h) % 2 == 0:
+            return bytes.fromhex(h)
+    return None
+
+
+def _as_ip(value: Any) -> str | None:
+    if isinstance(value, list) and len(value) == 4 and all(isinstance(x, int) for x in value):
+        value = ".".join(str(x) for x in value)
+    if isinstance(value, str):
+        try:
+            return str(ipaddress.IPv4Address(value))
+        except ValueError:
+            return None
+    return None
+
+
+def _remaining(lease: dict[str, Any], uptime: float | None, epoch: float | None) -> int | None:
+    for key in ("ExpirationRealtimeUSec", "ExpirationUSec"):
+        v = lease.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            secs = v / 1_000_000
+            ref = epoch if secs > 1e9 else uptime  # wall clock vs CLOCK_BOOTTIME (= /proc/uptime)
+            if ref is not None:
+                return max(0, int(secs - ref))
+    return None
+
+
+def _find_dhcp_server(obj: Any) -> dict[str, Any] | None:
+    if isinstance(obj, dict):
+        if isinstance(obj.get("DHCPServer"), dict):
+            return obj["DHCPServer"]
+        children = obj.values()
+    elif isinstance(obj, list):
+        children = obj
+    else:
+        return None
+    for child in children:
+        found = _find_dhcp_server(child)
+        if found is not None:
+            return found
+    return None
+
+
+def _json_leases(text: str, uptime: float | None, epoch: float | None) -> list[dict[str, Any]] | None:
+    docs: list[Any] = []
+    for line in text.splitlines():
+        if line.strip():
+            try:
+                docs.append(json.loads(line))
+            except ValueError:
+                docs = []
+                break
+    if not docs and text.strip():
+        try:
+            docs = [json.loads(text)]
+        except ValueError:
+            return None
+    server = next((s for s in (_find_dhcp_server(d) for d in docs) if s is not None), None)
+    if server is None:
+        return None
+    out = []
+    for lease in server.get("Leases") or []:
+        if not isinstance(lease, dict):
+            continue
+        address = _as_ip(lease.get("Address"))
+        if address is None:
+            continue
+        raw = _as_bytes(lease.get("ClientId")) or b""
+        out.append({"address": address, "mac": mac_from_client_id(raw), "client_id": _hex(raw) if raw else "",
+                    "hostname": str(lease.get("Hostname") or ""), "expires_in": _remaining(lease, uptime, epoch)})
+    return out
+
+
+def _text_leases(text: str) -> list[dict[str, Any]]:
+    out = []
+    for address, client in _TEXT_LEASE_RE.findall(text):
+        ip = _as_ip(address)
+        if ip is None:
+            continue
+        client = client.strip()
+        mac = client.lower() if _MAC_RE.match(client.lower()) else None
+        out.append({"address": ip, "mac": mac, "client_id": client, "hostname": "", "expires_in": None})
+    return out
+
+
+def parse_leases(output: str) -> list[dict[str, Any]]:
+    """Active leases from the output of leases_command(): JSON form preferred, text form as a fallback."""
+    sections: dict[str, dict[str, str]] = {}
+    uptime = epoch = None
+    current: str | None = None
+    part: str | None = None
+    for line in output.splitlines():
+        if line.startswith("##HVD-IF "):
+            current, part = line.split(None, 1)[1].strip(), None
+            sections[current] = {"json": "", "text": ""}
+        elif line.strip() in ("##HVD-JSON", "##HVD-TEXT"):
+            part = "json" if line.strip() == "##HVD-JSON" else "text"
+        elif line.startswith("##HVD-CLOCK"):
+            fields = line.split()
+            try:
+                uptime, epoch = float(fields[1]), float(fields[2])
+            except (IndexError, ValueError):
+                pass
+            current = None
+        elif current is not None and part is not None:
+            sections[current][part] += line + "\n"
+    leases = []
+    for ifname, sec in sections.items():
+        found = _json_leases(sec["json"], uptime, epoch)
+        if found is None:
+            found = _text_leases(sec["text"])
+        vlan = int(ifname[2:]) if _SVI_RE.match(ifname) else None
+        for lease in found:
+            leases.append({"interface": ifname, "vlan": vlan, **lease})
+    return leases
 
 
 def render_all(spec: RouterSpec) -> dict[str, str]:
