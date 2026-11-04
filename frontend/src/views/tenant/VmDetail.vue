@@ -51,43 +51,8 @@
       </el-tab-pane>
 
       <el-tab-pane :label="t('vms.hardware')" name="hw">
-        <h4>
-          vCPU / {{ t('vms.memory') }}: {{ vm.vcpu }} / {{ fmtMb(vm.memory_mb) }}
-          <el-tooltip v-if="can('vm.edit')" :content="t('vms.mustBeOff')">
-            <el-button size="small" :disabled="!ready || vm.power_state !== 'Off'" @click="openCompute" class="ml">{{ t('vms.editCompute') }}</el-button>
-          </el-tooltip>
-        </h4>
-
-        <h4>{{ t('vms.disks') }}
-          <el-button v-if="can('vm.edit')" size="small" :disabled="!ready" class="ml" @click="openAddDisk"><el-icon><IconPlus /></el-icon>{{ t('vms.addDisk') }}</el-button>
-        </h4>
-        <el-table :data="vm.disks" size="small">
-          <el-table-column :label="'#'" width="60" prop="position" />
-          <el-table-column :label="t('common.size')" width="120"><template #default="{ row }">{{ fmtGb(row.size_gb) }}</template></el-table-column>
-          <el-table-column prop="storage_class" :label="t('vms.storageClass')" min-width="160" />
-        </el-table>
-
-        <h4>{{ t('vms.nics') }}
-          <el-button v-if="can('vm.edit')" size="small" :disabled="!ready" class="ml" @click="addNic"><el-icon><IconPlus /></el-icon>{{ t('vms.addNic') }}</el-button>
-        </h4>
-        <el-table :data="vm.nics" size="small">
-          <el-table-column prop="name" :label="t('common.name')" width="90" />
-          <el-table-column :label="t('nav.networks')" min-width="240">
-            <template #default="{ row }">
-              <el-select v-if="can('vm.edit')" :model-value="row.network_id" clearable size="small" :placeholder="t('vms.disconnected')"
-                         :disabled="!ready" style="width: 260px" @change="(v) => changeNic(row, v)">
-                <el-option v-for="n in networks" :key="n.id" :value="n.id" :label="`${n.name} (VLAN ${n.vlan_id})`" />
-              </el-select>
-              <span v-else>{{ row.network ? `${row.network} (VLAN ${row.vlan_id})` : t('vms.disconnected') }}</span>
-            </template>
-          </el-table-column>
-          <el-table-column :label="t('vms.mac')" width="170"><template #default="{ row }"><span class="mono">{{ row.mac || '—' }}</span></template></el-table-column>
-          <el-table-column width="60">
-            <template #default="{ row }">
-              <el-button v-if="can('vm.edit')" link type="danger" :disabled="!ready" @click="removeNic(row)"><el-icon><IconDelete /></el-icon></el-button>
-            </template>
-          </el-table-column>
-        </el-table>
+        <VmHardware :vm="vm" :ready="ready" :can-edit="can('vm.edit')" :networks="networks"
+                    :load-classes="() => api.get('/api/tenant/storage-classes')" :reconfigure="reconfigure" />
 
         <h4>{{ t('vms.media') }}</h4>
         <div class="media">
@@ -100,6 +65,10 @@
             <el-button size="small" :disabled="!ready || !vm.iso" @click="actions.media(vm, null)">{{ t('vms.eject') }}</el-button>
           </template>
         </div>
+      </el-tab-pane>
+
+      <el-tab-pane :label="t('vms.monitoring')" name="monitoring" lazy>
+        <VmMetrics :url="`/api/tenant/vms/${vm.id}/metrics`" />
       </el-tab-pane>
 
       <el-tab-pane :label="`${t('vms.snapshots')} (${vm.snapshots.length})`" name="snap">
@@ -147,39 +116,12 @@
       </el-tab-pane>
     </el-tabs>
 
-    <el-dialog v-model="computeDlg" :title="t('vms.editCompute')" width="420px">
-      <el-form label-width="140px">
-        <el-form-item label="vCPU"><el-input-number v-model="compute.vcpu" :min="1" :max="64" /></el-form-item>
-        <el-form-item :label="t('vmWizard.memoryGb')"><el-input-number v-model="compute.memory_gb" :min="0.5" :step="1" :precision="1" /></el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="computeDlg = false">{{ t('common.cancel') }}</el-button>
-        <el-button type="primary" @click="saveCompute">{{ t('common.apply') }}</el-button>
-      </template>
-    </el-dialog>
-
-    <el-dialog v-model="diskDlg" :title="t('vms.addDisk')" width="480px">
-      <el-form label-width="160px">
-        <el-form-item :label="t('vmWizard.diskSize')"><el-input-number v-model="newDisk.size_gb" :min="1" :max="65536" /></el-form-item>
-        <el-form-item :label="t('vms.storageClass')">
-          <el-select v-model="newDisk.storage_class_id">
-            <el-option v-for="c in classes" :key="c.id" :value="c.id" :disabled="!c.available"
-                       :label="`${c.name} — ${c.limit_gb === null ? t('quota.unlimited') : t('vmWizard.available', { n: fmtGb(c.limit_gb - c.used_gb) })}`" />
-          </el-select>
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="diskDlg = false">{{ t('common.cancel') }}</el-button>
-        <el-button type="primary" :disabled="!newDisk.storage_class_id" @click="saveDisk">{{ t('common.add') }}</el-button>
-      </template>
-    </el-dialog>
-
     <ConsoleDialog ref="consoleDlg" />
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -190,7 +132,9 @@ import { useVmActions } from '../../composables/vmActions'
 import VmState from '../../components/VmState.vue'
 import VmActionsMenu from '../../components/VmActionsMenu.vue'
 import ConsoleDialog from '../../components/ConsoleDialog.vue'
-import { fmtDate, fmtGb, fmtMb, fmtUptime, statusType, taskKind } from '../../utils/format'
+import VmHardware from '../../components/VmHardware.vue'
+import VmMetrics from '../../components/VmMetrics.vue'
+import { fmtDate, fmtMb, fmtUptime, statusType, taskKind } from '../../utils/format'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -200,15 +144,10 @@ const vm = ref(null)
 const tab = ref('general')
 const networks = ref([])
 const isos = ref([])
-const classes = ref([])
 const access = ref([])
 const vmTasks = ref([])
 const isoId = ref(null)
 const consoleDlg = ref(null)
-const computeDlg = ref(false)
-const diskDlg = ref(false)
-const compute = reactive({ vcpu: 1, memory_gb: 1 })
-const newDisk = reactive({ size_gb: 50, storage_class_id: null })
 const base = computed(() => `/tenant/${auth.tenant.slug}`)
 const ready = computed(() => vm.value && vm.value.status === 'ready')
 const can = (p) => (vm.value?.permissions || []).includes(p)
@@ -255,42 +194,8 @@ async function editDescription() {
   }
 }
 
-function openCompute() {
-  compute.vcpu = vm.value.vcpu
-  compute.memory_gb = vm.value.memory_mb / 1024
-  computeDlg.value = true
-}
-
 async function reconfigure(body) {
   return actions.run(api.post(`/api/tenant/vms/${vm.value.id}/reconfigure`, body), vm.value)
-}
-
-async function saveCompute() {
-  computeDlg.value = false
-  await reconfigure({ vcpu: compute.vcpu, memory_mb: Math.round(compute.memory_gb * 1024) })
-}
-
-async function openAddDisk() {
-  classes.value = await api.get('/api/tenant/storage-classes')
-  newDisk.storage_class_id = classes.value.find((c) => c.available)?.id || null
-  diskDlg.value = true
-}
-
-async function saveDisk() {
-  diskDlg.value = false
-  await reconfigure({ add_disks: [{ ...newDisk }] })
-}
-
-const addNic = () => reconfigure({ nics: [{ op: 'add', network_id: networks.value[0]?.id || null }] })
-const changeNic = (nic, networkId) => reconfigure({ nics: [{ op: 'set', nic_id: nic.id, network_id: networkId || null }] })
-
-async function removeNic(nic) {
-  try {
-    await ElMessageBox.confirm(t('common.confirmDelete', { name: nic.name }), t('common.confirmTitle'), { type: 'warning' })
-  } catch {
-    return
-  }
-  await reconfigure({ nics: [{ op: 'remove', nic_id: nic.id }] })
 }
 
 onMounted(async () => {

@@ -147,6 +147,69 @@ def cmd_check(_: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
+def cmd_hv_run(args: argparse.Namespace) -> int:
+    """Run one of the PowerShell scripts of HV Director on a Hyper-V node and print its JSON result.
+
+    With --cluster the stored (encrypted) WinRM settings of that cluster are used; otherwise the
+    connection is given on the command line (password from HVD_HV_PASSWORD or a prompt).
+    """
+    import json
+    import os
+
+    from sqlalchemy import select
+
+    from .hyperv import Endpoint, HyperVError
+    from .hyperv.psrp import SCRIPTS_DIR, PsrpDriver
+
+    script = args.script.removesuffix(".ps1")
+    if not (SCRIPTS_DIR / f"{script}.ps1").exists() or script.startswith("_"):
+        names = sorted(p.stem for p in SCRIPTS_DIR.glob("*.ps1") if not p.stem.startswith("_"))
+        print(f"Unknown script {script}. Available: {', '.join(names)}", file=sys.stderr)
+        return 2
+    try:
+        script_args = json.loads(args.args) if args.args else {}
+    except ValueError as exc:
+        print(f"--args must be JSON: {exc}", file=sys.stderr)
+        return 2
+    if args.cluster:
+        from .db import SessionLocal
+        from .models import Cluster
+        from .services.inventory import endpoint_for
+
+        db = SessionLocal()
+        try:
+            cluster = db.scalar(select(Cluster).where(Cluster.name == args.cluster))
+            if cluster is None:
+                print(f"Cluster {args.cluster!r} not found", file=sys.stderr)
+                return 1
+            host = None
+            if args.host:
+                host = next((h for h in cluster.hosts if args.host.lower() in (h.name.lower(), (h.address or "").lower())),
+                            None)
+                if host is None:
+                    print(f"Node {args.host!r} is not part of {cluster.name}", file=sys.stderr)
+                    return 1
+            ep = endpoint_for(cluster, host)
+        finally:
+            db.close()
+    else:
+        if not args.address or not args.username:
+            print("Give --cluster NAME, or --address and --username", file=sys.stderr)
+            return 2
+        password = os.environ.get("HVD_HV_PASSWORD") or getpass.getpass(f"Password for {args.username}: ")
+        ep = Endpoint(address=args.address, username=args.username, password=password, transport=args.transport,
+                      port=args.port or (5986 if args.transport == "https" else 5985), auth=args.auth,
+                      cert_validation=args.cert_validation)
+    try:
+        result = PsrpDriver(operation_timeout=args.timeout, read_timeout=args.timeout + 10).run(ep, script, script_args)
+    except HyperVError as exc:
+        print(json.dumps({"ok": False, "code": exc.code, "host": ep.display, "error": str(exc)}, ensure_ascii=False,
+                         indent=2))
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
 def cmd_fake(args: argparse.Namespace) -> int:
     from .config import get_config
     from .hyperv.fake import FakeDriver
@@ -196,6 +259,20 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_reset_password)
 
     sub.add_parser("check", help="check database and guacd connectivity").set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("hv-run", help="(debugging) run an HV Director PowerShell script on a Hyper-V node")
+    p.add_argument("script", help="script name, e.g. ping, host_info, list_vms, vm_info, vm_metrics")
+    p.add_argument("--args", help='JSON arguments of the script, e.g. \'{"id": "<VM GUID>"}\'')
+    p.add_argument("--cluster", help="use the stored connection settings of this cluster")
+    p.add_argument("--host", help="node name or address within --cluster (default: the cluster seed address)")
+    p.add_argument("--address", help="node address (without --cluster)")
+    p.add_argument("--username", help="DOMAIN\\user (without --cluster)")
+    p.add_argument("--auth", default="ntlm", choices=["ntlm", "negotiate", "kerberos", "credssp", "basic"])
+    p.add_argument("--transport", default="http", choices=["http", "https"])
+    p.add_argument("--port", type=int)
+    p.add_argument("--cert-validation", action="store_true")
+    p.add_argument("--timeout", type=int, default=60, help="WinRM operation timeout, s")
+    p.set_defaults(fn=cmd_hv_run)
 
     p = sub.add_parser("fake", help="control the Hyper-V simulator (HVD_HYPERV_DRIVER=fake)")
     fsub = p.add_subparsers(dest="fake_cmd", required=True)

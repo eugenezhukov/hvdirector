@@ -54,6 +54,15 @@
             <el-form-item><el-button type="primary" @click="saveMany(['sync', 'placement'])">{{ t('common.save') }}</el-button></el-form-item>
           </el-form>
         </div>
+        <div class="card">
+          <h3>{{ t('settings.metrics') }}</h3>
+          <div class="form-hint" style="margin-bottom: 10px">{{ t('settings.metricsHint') }}</div>
+          <el-form label-width="260px">
+            <el-form-item :label="t('settings.metricsInterval')"><el-input-number v-model="s.metrics.interval_s" :min="0" :max="3600" :step="30" controls-position="right" /></el-form-item>
+            <el-form-item :label="t('settings.metricsRetention')"><el-input-number v-model="s.metrics.retention_days" :min="1" :max="365" controls-position="right" /></el-form-item>
+            <el-form-item><el-button type="primary" @click="save('metrics')">{{ t('common.save') }}</el-button></el-form-item>
+          </el-form>
+        </div>
         <RouterSettingsCard />
         <div class="card">
           <h3>{{ t('settings.security') }}</h3>

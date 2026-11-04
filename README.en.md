@@ -18,7 +18,13 @@ images, take snapshots and open VM consoles in the browser.
   organization-wide or **delegated on a single VM**.
 * **VM lifecycle**: create (generation 1/2, Secure Boot, disks per class, NICs, ISO), power on, guest
   shutdown, power off, guest restart, reset, snapshots (take / revert / delete), insert/eject ISO,
-  change vCPU/RAM, add disks and adapters, delete.
+  change vCPU and memory (memory of a running VM on the fly), extend / remove / add disks, add / remove
+  adapters and change their network, delete.
+* **VM load graphs**: CPU, memory (assigned / guest demand), disk (read, write, IOPS) and network (received,
+  sent) for 1 hour … 30 days with current values and a table view; collected every minute from the Hyper-V
+  nodes (hypervisor counters and resource metering), kept 14 days (configurable).
+* **Provider VM management**: power, reset, console, vCPU / memory / disks / adapters and graphs of any
+  tenant VM; tenant quotas apply, tasks are visible to the organization and audited.
 * **Placement**: the node with the most free memory; in a cluster the VM is registered as a
   highly-available role. VMs moved by live migration or failover are located automatically.
 * **Networking**: the provider assigns VLAN ranges of a pre-built L2 underlay to a tenant (no overlaps);

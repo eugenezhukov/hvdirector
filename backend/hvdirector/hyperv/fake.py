@@ -19,6 +19,7 @@ import datetime as dt
 import fcntl
 import ipaddress
 import json
+import math
 import os
 import random
 import time
@@ -35,6 +36,18 @@ def _now() -> str:
 
 def _mac() -> str:
     return "00155D" + "".join(random.choice("0123456789ABCDEF") for _ in range(6))
+
+
+def _fake_load(seed: str, t: float) -> dict[str, float]:
+    """Smooth, VM-specific simulated load: CPU and memory fractions, disk/network MB/s, IO/s."""
+    phase = (int(seed.replace("-", "")[:8], 16) % 1000) / 1000 * 2 * math.pi
+
+    def wave(period: float, k: float = 1.0) -> float:
+        return 0.5 + 0.5 * math.sin(2 * math.pi * t / period + phase * k)
+
+    return {"cpu": 0.05 + 0.45 * wave(5400) * (0.6 + 0.4 * wave(1300, 2.3)), "mem": 0.3 + 0.3 * wave(7200, 1.7),
+            "read": 0.2 + 4.0 * wave(3600, 3.1) ** 3, "write": 0.1 + 2.0 * wave(2700, 0.7) ** 2,
+            "io": 20 + 180 * wave(2400, 1.3), "rx": 0.05 + 0.9 * wave(4000, 2.1), "tx": 0.02 + 0.5 * wave(3100, 0.4)}
 
 
 class FakeDriver(HyperVDriver):
@@ -408,12 +421,20 @@ class FakeDriver(HyperVDriver):
         with self._state(write=True) as st:
             host = self._connect(st, ep)
             vm = self._get_vm(st, host, vm_id)
-            if (changes.get("vcpu") or changes.get("memory_mb")) and vm["state"] != "Off":
-                raise HyperVError("Power off the VM to change vCPU or memory", "VM_MUST_BE_OFF", host["name"])
+            if changes.get("vcpu") and vm["state"] != "Off":
+                raise HyperVError("Power off the VM to change the number of vCPUs", "VM_MUST_BE_OFF", host["name"])
+            if (changes.get("resize_disks") or changes.get("remove_disks")) and vm.get("snapshots"):
+                raise HyperVError("Delete the VM checkpoints before changing its disks", "VM_HAS_SNAPSHOTS",
+                                  host["name"])
             if changes.get("vcpu"):
                 vm["vcpu"] = int(changes["vcpu"])
             if changes.get("memory_mb"):
-                vm["memory_mb"] = int(changes["memory_mb"])
+                vm["memory_mb"] = int(changes["memory_mb"])  # runtime resize when running
+            for d in changes.get("resize_disks") or []:
+                disk = next((x for x in vm["disks"] if x["path"].lower() == d["path"].lower()), None)
+                if disk is None:
+                    raise HyperVError(f"Virtual disk {d['path']} not found", "PS_ERROR", host["name"])
+                disk["size_gb"] = max(int(disk["size_gb"]), int(d["size_gb"]))
             added = []
             for d in changes.get("add_disks") or []:
                 vm["disks"].append({"path": d["path"], "size_gb": d["size_gb"]})
@@ -440,9 +461,42 @@ class FakeDriver(HyperVDriver):
                         raise HyperVError(f"Network adapter {n['name']} not found", "PS_ERROR", host["name"])
                 elif n["op"] == "remove":
                     vm["nics"] = [x for x in vm["nics"] if x["name"] != n["name"]]
+            gone = {d["path"].lower() for d in changes.get("remove_disks") or []}
+            vm["disks"] = [x for x in vm["disks"] if x["path"].lower() not in gone]
             res = self._summary(vm)
             res.update({"added_disks": added, "nics": nic_out})
             return res
+
+    def vm_metrics(self, ep: Endpoint, vm_ids: list[str]) -> dict[str, Any]:
+        want = {str(i).upper() for i in vm_ids}
+        now = time.time()
+        with self._state(write=True) as st:
+            host = self._connect(st, ep)
+            out = []
+            for vm in st["vms"].values():
+                if vm["host"] != host["name"] or vm["id"].upper() not in want:
+                    continue
+                running = vm["state"] == "Running"
+                item: dict[str, Any] = {"id": vm["id"], "name": vm["name"], "state": vm["state"], "vcpu": vm["vcpu"],
+                                        "cpu_usage": 0, "mem_assigned_mb": vm["memory_mb"] if running else 0,
+                                        "mem_demand_mb": 0, "cpu": None, "disk": None, "net": None}
+                m = vm.setdefault("meter", {"t": now, "run": 0.0, "read": 0.0, "write": 0.0, "io": 0.0,
+                                            "rx": 0.0, "tx": 0.0})
+                if running:
+                    span = max(0.0, now - m["t"])
+                    load = _fake_load(vm["id"], now)
+                    m["run"] += load["cpu"] * vm["vcpu"] * span * 1e7  # 100 ns units, like the hypervisor counters
+                    for key in ("read", "write", "io", "rx", "tx"):
+                        m[key] += load[key] * span
+                    item.update(
+                        cpu_usage=round(load["cpu"] * 100 * vm["vcpu"] / host["logical_cpus"]),
+                        mem_demand_mb=int(vm["memory_mb"] * load["mem"]),
+                        cpu={"run": int(m["run"]), "n": vm["vcpu"], "ts": int(now * 1e7)},
+                        disk={"read_mb": int(m["read"]), "write_mb": int(m["write"]), "io": int(m["io"])},
+                        net={"rx_mb": int(m["rx"]), "tx_mb": int(m["tx"])})
+                m["t"] = now
+                out.append(item)
+            return {"host": host["name"], "logical_cpus": host["logical_cpus"], "vms": out, "errors": []}
 
     def console_connection(self, host_address: str, port: int, vm_hv_id: str, username: str,
                            password: str, domain: str) -> tuple[str, dict[str, str]]:

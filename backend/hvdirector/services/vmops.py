@@ -340,7 +340,7 @@ def vm_media(db: Session, driver: HyperVDriver, task: Task, ctx: TaskContext) ->
 
 
 # --------------------------------------------------------------------------
-# Reconfigure (vCPU/RAM, add disk, NIC changes)
+# Reconfigure (vCPU/RAM, add / extend / remove disks, NIC changes)
 # --------------------------------------------------------------------------
 
 
@@ -348,7 +348,7 @@ def vm_media(db: Session, driver: HyperVDriver, task: Task, ctx: TaskContext) ->
 def vm_reconfigure(db: Session, driver: HyperVDriver, task: Task, ctx: TaskContext) -> dict[str, Any]:
     vm = _vm(db, task)
     p = task.params
-    changes: dict[str, Any] = {"add_disks": [], "nics": []}
+    changes: dict[str, Any] = {"add_disks": [], "resize_disks": [], "remove_disks": [], "nics": []}
     if p.get("vcpu"):
         changes["vcpu"] = p["vcpu"]
     if p.get("memory_mb"):
@@ -359,6 +359,15 @@ def vm_reconfigure(db: Session, driver: HyperVDriver, task: Task, ctx: TaskConte
             continue
         d.path = disk_path(vm, d)
         changes["add_disks"].append({"path": d.path, "size_gb": d.size_gb})
+    for r in p.get("resize_disks", []):
+        d = db.get(VMDisk, uuid.UUID(r["disk_id"]))
+        if d is not None and d.path:
+            changes["resize_disks"].append({"path": d.path, "size_gb": r["size_gb"]})
+    removed = [db.get(VMDisk, uuid.UUID(x)) for x in p.get("remove_disk_ids", [])]
+    removed = [d for d in removed if d is not None]
+    for d in removed:
+        if d.path:
+            changes["remove_disks"].append({"path": d.path})
     for n in p.get("nic_ops", []):
         nic = db.get(VMNic, uuid.UUID(n["nic_id"])) if n.get("nic_id") else None
         net = db.get(Network, uuid.UUID(n["network_id"])) if n.get("network_id") else None
@@ -385,6 +394,8 @@ def vm_reconfigure(db: Session, driver: HyperVDriver, task: Task, ctx: TaskConte
             nic.network_id = uuid.UUID(n["network_id"]) if n.get("network_id") else None
         elif n["op"] == "remove":
             db.delete(nic)
+    for d in removed:
+        db.delete(d)
     apply_vm_summary(vm, res, host)
     return {"ok": True}
 
@@ -404,6 +415,10 @@ def vm_reconfigure_failed(db: Session, driver: HyperVDriver, task: Task, exc: Ex
         disk = db.get(VMDisk, uuid.UUID(d))
         if disk is not None:
             db.delete(disk)
+    for r in p.get("resize_disks", []):
+        disk = db.get(VMDisk, uuid.UUID(r["disk_id"]))
+        if disk is not None:
+            disk.size_gb = r["old_size_gb"]
     for n in p.get("nic_ops", []):
         if n["op"] == "add" and n.get("nic_id"):
             nic = db.get(VMNic, uuid.UUID(n["nic_id"]))

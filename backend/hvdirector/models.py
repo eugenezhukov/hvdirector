@@ -305,6 +305,8 @@ class VM(Base):
     uptime_s: Mapped[int | None] = mapped_column(BigInteger)
     last_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
     last_sync_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    # last raw (cumulative) load counters read from Hyper-V; rates are computed from consecutive readings
+    metrics_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     created_at: Mapped[dt.datetime] = _created()
 
@@ -730,3 +732,22 @@ class DhcpBinding(Base):
         Index("ux_dhcp_bindings_mac", "network_id", "mac", unique=True),
         Index("ux_dhcp_bindings_address", "network_id", "address", unique=True),
     )
+
+
+class VmMetric(Base):
+    """VM load sample: averages over one collection interval (CPU %, memory, disk and network rates)."""
+
+    __tablename__ = "vm_metrics"
+
+    vm_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("vms.id", ondelete="CASCADE"), primary_key=True)
+    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    cpu_pct: Mapped[float | None] = mapped_column(Float)
+    mem_assigned_mb: Mapped[int | None] = mapped_column(Integer)
+    mem_demand_mb: Mapped[int | None] = mapped_column(Integer)
+    disk_read_bps: Mapped[float | None] = mapped_column(Float)
+    disk_write_bps: Mapped[float | None] = mapped_column(Float)
+    disk_iops: Mapped[float | None] = mapped_column(Float)
+    net_rx_bps: Mapped[float | None] = mapped_column(Float)
+    net_tx_bps: Mapped[float | None] = mapped_column(Float)
+
+    __table_args__ = (Index("ix_vm_metrics_ts", "ts"),)

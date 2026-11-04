@@ -102,6 +102,15 @@ class HyperVDriver(ABC):
     def find_owner(self, ep: Endpoint, group: str | None, vm_id: str | None) -> dict[str, Any]: ...
 
     @abstractmethod
+    def vm_metrics(self, ep: Endpoint, vm_ids: list[str]) -> dict[str, Any]:
+        """Raw cumulative load counters of the given VMs running on this host.
+
+        {"host", "logical_cpus", "vms": [{"id", "name", "state", "vcpu", "cpu_usage",
+        "mem_assigned_mb", "mem_demand_mb", "cpu": {"run", "n", "ts"} | None,
+        "disk": {"read_mb", "write_mb", "io"} | None, "net": {"rx_mb", "tx_mb"} | None}], "errors": [...]}
+        """
+
+    @abstractmethod
     def test_path(self, ep: Endpoint, path: str) -> dict[str, Any]: ...
 
     def console_connection(self, host_address: str, port: int, vm_hv_id: str, username: str,

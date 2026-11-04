@@ -873,6 +873,12 @@ def put_setting(key: str, body: dict, p: Principal = Depends(provider_admin), db
         value["port"] = int(value["port"])
     if key == "sync" and "interval_s" in value:
         value["interval_s"] = max(0, int(value["interval_s"]))
+    if key == "metrics":
+        if "interval_s" in value:
+            iv = int(value["interval_s"])
+            value["interval_s"] = 0 if iv <= 0 else min(3600, max(30, iv))
+        if "retention_days" in value:
+            value["retention_days"] = min(365, max(1, int(value["retention_days"])))
     if key == "router":
         _validate_router_setting(db, value)
     merged = set_setting(db, key, value)

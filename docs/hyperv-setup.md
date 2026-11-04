@@ -115,9 +115,33 @@ VLAN внешних сетей (WAN, OOB management) тоже должны пр�
 * настроить Kerberos constrained delegation (служба `cifs` файлового сервера) для компьютерных
   учётных записей узлов.
 
-## 7. Проверка из PowerShell
+## 7. Графики загрузки ВМ и изменение дисков
+
+* Раз в минуту HV Director опрашивает каждый узел скриптом `vm_metrics.ps1`:
+  * CPU — счётчики гипервизора через CIM-класс `Win32_PerfRawData_HvStats_HyperVHypervisorVirtualProcessor`
+    (имена классов не локализуются, работает и на русской Windows Server);
+  * память — `MemoryAssigned` / `MemoryDemand` из `Get-VM`;
+  * диск и сеть — **Hyper-V resource metering** (`Measure-VM`). Метеринг включается автоматически
+    (`Enable-VMResourceMetering`) у включённых ВМ HV Director; для сети используются ACL с действием `Meter`
+    (`0.0.0.0/0`, `::/0`), которые не ограничивают трафик.
+* Отдельных прав, кроме членства сервисной учётной записи в Administrators узла, не нужно.
+* Расширение диска — `Resize-VHD` (только увеличение, VHDX). Диски данных подключены к SCSI и расширяются /
+  удаляются у включённой ВМ; системный IDE-диск ВМ поколения 1 — только у выключенной. Пока у ВМ есть
+  контрольные точки (снапшоты), диски не меняются. Раздел внутри гостевой ОС расширяет владелец ВМ.
+* Память включённой ВМ меняется «на лету» (runtime memory resize, Windows Server 2016+): гостевая ОС должна
+  это поддерживать, иначе задача завершится ошибкой и изменение будет отменено.
+* Для дисков на SMB3-шаре (Scale-Out File Server) операции `New-VHD`/`Resize-VHD` выполняются в удалённой
+  сессии и упираются в двойной переход так же, как ISO (см. п. 6): нужны CredSSP или Kerberos constrained
+  delegation (служба `cifs` файлового сервера).
+
+## 8. Проверка из PowerShell
 
 ```powershell
 Test-WSMan -ComputerName hv01 -Authentication Negotiate -Credential CORP\svc-hvdirector
 Invoke-Command -ComputerName hv01 -Credential CORP\svc-hvdirector -ScriptBlock { Get-VMHost; Get-ClusterNode }
+# источники графиков загрузки
+Invoke-Command -ComputerName hv01 -Credential CORP\svc-hvdirector -ScriptBlock {
+    Get-CimInstance Win32_PerfRawData_HvStats_HyperVHypervisorVirtualProcessor | Select-Object -First 3 Name, PercentTotalRunTime
+    $vm = Get-VM | Select-Object -First 1; Enable-VMResourceMetering -VM $vm; Measure-VM -VM $vm | Format-List *
+}
 ```

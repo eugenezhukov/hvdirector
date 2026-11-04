@@ -24,6 +24,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     "guacd": {"host": "127.0.0.1", "port": 4822},
     "console": {"keyboard_layout": "en-us-qwerty", "ticket_ttl_s": 60},
     "sync": {"interval_s": 60},
+    # VM load graphs: collection interval (0 = off) and retention of the samples
+    "metrics": {"interval_s": 60, "retention_days": 14},
     "security": {"session_idle_minutes": 480, "session_max_hours": 24, "max_failed_logins": 10,
                  "lockout_minutes": 15},
     "placement": {"memory_reserve_mb": 4096},

@@ -22,6 +22,7 @@ const routes = [
       { path: 'tenants', name: 'p-tenants', component: () => import('./views/provider/TenantsView.vue') },
       { path: 'tenants/:id', name: 'p-tenant', component: () => import('./views/provider/TenantDetail.vue') },
       { path: 'vms', name: 'p-vms', component: () => import('./views/provider/ProviderVms.vue') },
+      { path: 'vms/:id', name: 'p-vm', component: () => import('./views/provider/ProviderVmDetail.vue') },
       { path: 'isos', name: 'p-isos', component: () => import('./views/provider/ProviderIsos.vue') },
       { path: 'users', name: 'p-users', component: () => import('./views/provider/ProviderUsers.vue') },
       { path: 'settings', name: 'p-settings', component: () => import('./views/provider/SettingsView.vue') },

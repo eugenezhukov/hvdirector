@@ -14,10 +14,11 @@ from sqlalchemy.orm import Session, selectinload
 
 from ..db import get_db
 from ..errors import AppError, Conflict, Forbidden, NotFound
-from ..models import (VM, ConsoleTicket, Datastore, Iso, Network, Router, RouterNetwork, Snapshot, StorageClass, Task,
-                      TenantStorageQuota, TenantVlan, User, VMDisk, VMNic, utcnow)
+from ..models import (VM, ConsoleTicket, Iso, Network, Router, RouterNetwork, Snapshot, Task, TenantVlan, User, VMDisk,
+                      VMNic, utcnow)
 from ..security import hash_token, new_token
 from ..services import isos as iso_svc
+from ..services import metrics as metrics_svc
 from ..services import netutil
 from ..services import routers as rsvc
 from ..services import users as user_svc
@@ -26,9 +27,10 @@ from ..services.quotas import Delta, check_quota, lock_tenant, quota_report
 from ..services.rbac import Principal
 from ..services.settings import get_setting
 from ..services.taskqueue import enqueue, task_to_dict
+from ..services.vmconfig import pick_datastore, plan_reconfigure, tenant_storage_classes
 from ..utils import NETWORK_NAME_RE, VM_NAME_RE, hv_vm_name
 from .deps import get_vm_for, require_tenant_perm, tenant_user
-from .serializers import iso_to_dict, network_to_dict, storage_class_to_dict, user_to_dict, vm_to_dict
+from .serializers import iso_to_dict, network_to_dict, user_to_dict, vm_to_dict
 
 router = APIRouter(prefix="/api/tenant", tags=["tenant"])
 
@@ -69,18 +71,7 @@ def summary(p: Principal = Depends(tenant_user), db: Session = Depends(get_db)) 
 
 @router.get("/storage-classes")
 def storage_classes(p: Principal = Depends(tenant_user), db: Session = Depends(get_db)) -> list[dict]:
-    report = {s["storage_class_id"]: s for s in quota_report(db, p.tenant)["storage"]}
-    out = []
-    for q in db.scalars(select(TenantStorageQuota).where(TenantStorageQuota.tenant_id == p.tenant_id)):
-        sc = db.get(StorageClass, q.storage_class_id)
-        has_ds = db.scalar(select(func.count(Datastore.id)).where(
-            Datastore.cluster_id == p.tenant.cluster_id, Datastore.storage_class_id == sc.id,
-            Datastore.enabled.is_(True), Datastore.present.is_(True))) or 0
-        out.append(storage_class_to_dict(sc) | {"limit_gb": q.limit_gb,
-                                               "used_gb": report.get(str(sc.id), {}).get("used_gb", 0),
-                                               "available": bool(has_ds)})
-    out.sort(key=lambda x: (x["tier"], x["name"]))
-    return out
+    return tenant_storage_classes(db, p.tenant)
 
 
 # ==========================================================================
@@ -133,24 +124,18 @@ class NicOpIn(BaseModel):
     network_id: uuid.UUID | None = None
 
 
+class DiskOpIn(BaseModel):
+    op: Literal["resize", "remove"]
+    disk_id: uuid.UUID
+    size_gb: int | None = Field(default=None, ge=1, le=65536)
+
+
 class ReconfigureIn(BaseModel):
     vcpu: int | None = Field(default=None, ge=1, le=240)
     memory_mb: int | None = Field(default=None, ge=256, le=12 * 1024 * 1024)
     add_disks: list[DiskIn] = Field(default=[], max_length=8)
+    disk_ops: list[DiskOpIn] = Field(default=[], max_length=16)
     nics: list[NicOpIn] = Field(default=[], max_length=8)
-
-
-def _pick_datastore(db: Session, cluster_id: uuid.UUID, storage_class_id: uuid.UUID, ha: bool) -> Datastore:
-    rows = db.scalars(select(Datastore).where(
-        Datastore.cluster_id == cluster_id, Datastore.storage_class_id == storage_class_id,
-        Datastore.enabled.is_(True), Datastore.present.is_(True))).all()
-    if ha:
-        rows = [d for d in rows if d.kind in ("csv", "smb")]
-    if not rows:
-        sc = db.get(StorageClass, storage_class_id)
-        raise AppError("no_datastore_for_class", "No datastore of this storage class on the tenant cluster",
-                       storage_class=sc.name if sc else str(storage_class_id))
-    return max(rows, key=lambda d: d.free_gb or 0)
 
 
 def _tenant_network(db: Session, p: Principal, network_id: uuid.UUID) -> Network:
@@ -212,7 +197,7 @@ def create_vm(body: VmCreateIn, p: Principal = Depends(tenant_user), db: Session
     db.add(vm)
     db.flush()
     for i, d in enumerate(body.disks):
-        ds = _pick_datastore(db, cluster.id, d.storage_class_id, ha)
+        ds = pick_datastore(db, cluster.id, d.storage_class_id, ha)
         db.add(VMDisk(vm_id=vm.id, datastore_id=ds.id, storage_class_id=d.storage_class_id, size_gb=d.size_gb,
                       position=i))
     for i, net in enumerate(nets):
@@ -348,66 +333,19 @@ def media(vm_id: uuid.UUID, body: MediaIn, p: Principal = Depends(tenant_user), 
 def reconfigure(vm_id: uuid.UUID, body: ReconfigureIn, p: Principal = Depends(tenant_user),
                 db: Session = Depends(get_db)) -> dict:
     vm = get_vm_for(db, p, vm_id, "vm.edit")
-    _require_ready(vm)
-    tenant = lock_tenant(db, p.tenant_id)
-    cluster = tenant.cluster
-    params: dict = {"new_disk_ids": [], "nic_ops": []}
-    delta = Delta()
-    cpu_mem_change = (body.vcpu and body.vcpu != vm.vcpu) or (body.memory_mb and body.memory_mb != vm.memory_mb)
-    if cpu_mem_change:
-        if vm.power_state != "Off":
-            raise Conflict("vm_must_be_off", "Power off the VM to change vCPU or memory")
-        if body.vcpu and body.vcpu != vm.vcpu:
-            delta.vcpu = body.vcpu - vm.vcpu
-        if body.memory_mb and body.memory_mb != vm.memory_mb:
-            delta.memory_mb = body.memory_mb + (body.memory_mb % 2) - vm.memory_mb
-    for d in body.add_disks:
-        delta.storage_gb[d.storage_class_id] = delta.storage_gb.get(d.storage_class_id, 0) + d.size_gb
-    check_quota(db, tenant, delta)
-    if cpu_mem_change:
-        params["old_vcpu"], params["old_memory_mb"] = vm.vcpu, vm.memory_mb
-        if body.vcpu:
-            vm.vcpu = body.vcpu
-            params["vcpu"] = body.vcpu
-        if body.memory_mb:
-            vm.memory_mb = body.memory_mb + (body.memory_mb % 2)
-            params["memory_mb"] = vm.memory_mb
-    ha = cluster.kind == "cluster" and cluster.ha_enabled
-    next_disk = max([d.position for d in vm.disks] + [-1]) + 1
-    for d in body.add_disks:
-        ds = _pick_datastore(db, cluster.id, d.storage_class_id, ha)
-        disk = VMDisk(vm_id=vm.id, datastore_id=ds.id, storage_class_id=d.storage_class_id, size_gb=d.size_gb,
-                      position=next_disk)
-        next_disk += 1
-        db.add(disk)
-        db.flush()
-        params["new_disk_ids"].append(str(disk.id))
-    next_nic = max([n.position for n in vm.nics] + [-1]) + 1
-    for op in body.nics:
-        net = _tenant_network(db, p, op.network_id) if op.network_id else None
-        if op.op == "add":
-            if vm.generation == 1 and vm.power_state != "Off":
-                raise Conflict("vm_must_be_off", "Generation 1 VMs must be off to add network adapters")
-            nic = VMNic(vm_id=vm.id, network_id=net.id if net else None, position=next_nic, hv_name=f"nic{next_nic}")
-            next_nic += 1
-            db.add(nic)
-            db.flush()
-            params["nic_ops"].append({"op": "add", "nic_id": str(nic.id), "network_id": str(net.id) if net else None})
-        else:
-            nic = db.get(VMNic, op.nic_id) if op.nic_id else None
-            if nic is None or nic.vm_id != vm.id:
-                raise NotFound("nic")
-            if op.op == "remove" and vm.generation == 1 and vm.power_state != "Off":
-                raise Conflict("vm_must_be_off", "Generation 1 VMs must be off to remove network adapters")
-            params["nic_ops"].append({"op": op.op, "nic_id": str(nic.id), "hv_name": nic.hv_name,
-                                      "network_id": str(net.id) if net else None})
-    if not (cpu_mem_change or params["new_disk_ids"] or params["nic_ops"]):
-        raise AppError("nothing_to_change", "No changes requested")
+    params = plan_reconfigure(db, vm, body)
     task = _vm_task(db, p, vm, "vm.reconfigure", params)
     log_event(db, "vm.reconfigure", user=p.user, target_type="vm", target_id=vm.id, target_name=vm.name, ip=p.ip,
               details=body.model_dump(mode="json"))
     db.commit()
     return task_to_dict(task)
+
+
+@router.get("/vms/{vm_id}/metrics")
+def vm_metrics(vm_id: uuid.UUID, range: str = "1h", p: Principal = Depends(tenant_user),  # noqa: A002
+               db: Session = Depends(get_db)) -> dict:
+    vm = get_vm_for(db, p, vm_id)
+    return metrics_svc.series(db, vm, range)
 
 
 @router.post("/vms/{vm_id}/console")

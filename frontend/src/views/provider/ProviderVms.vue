@@ -9,7 +9,9 @@
     </div>
     <div class="card">
       <el-table v-loading="loading" :data="filtered" size="small" :empty-text="t('common.noData')">
-        <el-table-column prop="hv_name" label="Hyper-V" min-width="170" sortable />
+        <el-table-column prop="hv_name" label="Hyper-V" min-width="170" sortable>
+          <template #default="{ row }"><router-link class="link plain" :to="`/provider/vms/${row.id}`">{{ row.hv_name }}</router-link></template>
+        </el-table-column>
         <el-table-column prop="tenant" :label="t('common.organization')" width="140" sortable />
         <el-table-column prop="cluster" :label="t('common.cluster')" width="150" sortable />
         <el-table-column prop="host" :label="t('common.host')" width="150" sortable />
@@ -19,6 +21,23 @@
         <el-table-column :label="t('vms.disk')" width="100"><template #default="{ row }">{{ fmtGb(row.disk_gb) }}</template></el-table-column>
         <el-table-column :label="t('vms.ha')" width="60"><template #default="{ row }"><el-icon v-if="row.ha" color="#2e9e5b"><IconCheck /></el-icon></template></el-table-column>
         <el-table-column :label="t('vms.ips')" min-width="140"><template #default="{ row }"><span class="mono">{{ row.guest_ips.join(', ') }}</span></template></el-table-column>
+        <el-table-column width="120" align="right" fixed="right">
+          <template #default="{ row }">
+            <el-dropdown trigger="click" @command="(a) => onCommand(row, a)">
+              <el-button size="small">{{ t('common.actions') }}<el-icon class="el-icon--right"><IconArrowDown /></el-icon></el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="open"><el-icon><IconView /></el-icon>{{ t('common.open') }}</el-dropdown-item>
+                  <el-dropdown-item command="start" divided :disabled="row.status !== 'ready' || row.power_state === 'Running'"><el-icon><IconVideoPlay /></el-icon>{{ t('power.start') }}</el-dropdown-item>
+                  <el-dropdown-item command="shutdown" :disabled="row.status !== 'ready' || row.power_state !== 'Running'"><el-icon><IconSwitchButton /></el-icon>{{ t('power.shutdown') }}</el-dropdown-item>
+                  <el-dropdown-item command="reboot" :disabled="row.status !== 'ready' || row.power_state !== 'Running'"><el-icon><IconRefreshRight /></el-icon>{{ t('power.reboot') }}</el-dropdown-item>
+                  <el-dropdown-item command="poweroff" :disabled="row.status !== 'ready' || row.power_state === 'Off'"><el-icon><IconCircleClose /></el-icon>{{ t('power.poweroff') }}</el-dropdown-item>
+                  <el-dropdown-item command="reset" :disabled="row.status !== 'ready' || row.power_state !== 'Running'"><el-icon><IconRefreshLeft /></el-icon>{{ t('power.reset') }}</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+          </template>
+        </el-table-column>
       </el-table>
     </div>
   </div>
@@ -26,8 +45,10 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { api } from '../../api'
+import { useVmActions } from '../../composables/vmActions'
 import VmState from '../../components/VmState.vue'
 import { fmtGb, fmtMb } from '../../utils/format'
 
@@ -47,6 +68,12 @@ async function load() {
   } finally {
     loading.value = false
   }
+}
+const router = useRouter()
+const actions = useVmActions(() => load(), '/api/provider')
+function onCommand(row, cmd) {
+  if (cmd === 'open') router.push(`/provider/vms/${row.id}`)
+  else actions.power(row, cmd)
 }
 onMounted(load)
 </script>

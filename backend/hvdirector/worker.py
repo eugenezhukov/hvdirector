@@ -22,7 +22,7 @@ from .hyperv import HyperVError, get_driver
 from .logging_setup import setup_logging
 from .models import Task, UserSession, ConsoleTicket, Iso, utcnow
 from .services import routers as _routers  # noqa: F401 - registers router task handlers
-from .services import vmops
+from .services import metrics, vmops
 from .services.isostore import IsoStore
 from .services.settings import get_setting
 
@@ -50,6 +50,8 @@ class Worker:
         self.last_sync = 0.0
         self.last_housekeeping = 0.0
         self.sync_running = False
+        self.last_metrics = 0.0
+        self.metrics_running = False
 
     # ------------------------------------------------------------- lifecycle
     def recover(self) -> None:
@@ -165,12 +167,17 @@ class Worker:
         db = SessionLocal()
         try:
             interval = int(get_setting(db, "sync").get("interval_s", 60))
+            metrics_interval = int(get_setting(db, "metrics").get("interval_s", 60))
         finally:
             db.close()
         if interval > 0 and now - self.last_sync >= interval and not self.sync_running:
             self.last_sync = now
             self.sync_running = True
             self.pool.submit(self._sync)
+        if metrics_interval > 0 and now - self.last_metrics >= metrics_interval and not self.metrics_running:
+            self.last_metrics = now
+            self.metrics_running = True
+            self.pool.submit(self._metrics)
         if now - self.last_housekeeping >= 600:
             self.last_housekeeping = now
             self.pool.submit(self._housekeeping)
@@ -183,10 +190,21 @@ class Worker:
             db.close()
             self.sync_running = False
 
+    def _metrics(self) -> None:
+        db = SessionLocal()
+        try:
+            metrics.collect_all(db, self.driver)
+        except Exception:  # noqa: BLE001
+            log.exception("VM metrics collection failed")
+        finally:
+            db.close()
+            self.metrics_running = False
+
     def _housekeeping(self) -> None:
         db = SessionLocal()
         try:
             now = utcnow()
+            metrics.purge(db, int(get_setting(db, "metrics").get("retention_days", 14)))
             db.query(UserSession).filter(UserSession.expires_at < now).delete()
             db.query(ConsoleTicket).filter(ConsoleTicket.expires_at < now).delete()
             # Abandoned uploads (older than 24 h)

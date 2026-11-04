@@ -3,7 +3,7 @@ import { api } from '../api'
 import { errorText, i18n } from '../i18n'
 import { useTasks } from '../stores/tasks'
 
-export function useVmActions(onChange) {
+export function useVmActions(onChange, prefix = '/api/tenant') {
   const tasks = useTasks()
   const t = (...a) => i18n.global.t(...a)
 
@@ -32,7 +32,7 @@ export function useVmActions(onChange) {
   async function power(vm, action) {
     if (action === 'poweroff' && !(await confirm(t('power.confirmPoweroff', { name: vm.name })))) return
     if (action === 'reset' && !(await confirm(t('power.confirmReset', { name: vm.name })))) return
-    return run(api.post(`/api/tenant/vms/${vm.id}/power`, { action }), vm)
+    return run(api.post(`${prefix}/vms/${vm.id}/power`, { action }), vm)
   }
 
   async function snapshot(vm) {
@@ -69,7 +69,7 @@ export function useVmActions(onChange) {
   }
 
   function refresh(vm) {
-    return run(api.post(`/api/tenant/vms/${vm.id}/refresh`), vm)
+    return run(api.post(`${prefix}/vms/${vm.id}/refresh`), vm)
   }
 
   return { power, snapshot, revert, deleteSnapshot, remove, media, refresh, run }

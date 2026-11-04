@@ -75,7 +75,8 @@ def parse_output(output: list[Any], errors: list[str], host: str) -> Any:
         m = _ERR_RE.search(message)
         if m:
             raise HyperVError(m.group(2).strip(), m.group(1), host)
-        raise HyperVError(message, "PS_ERROR", host)
+        where = f" [line {payload['line']}: {payload.get('command') or '?'}]" if payload.get("line") else ""
+        raise HyperVError(message + where, "PS_ERROR", host)
     data = payload.get("data")
     if isinstance(data, list):  # stray pipeline output before "return"
         dicts = [d for d in data if isinstance(d, dict)]
@@ -190,3 +191,6 @@ class PsrpDriver(HyperVDriver):
 
     def reconfigure(self, ep: Endpoint, vm_id: str, changes: dict[str, Any]) -> dict[str, Any]:
         return self.run(ep, "vm_reconfigure", {"id": vm_id, **changes})
+
+    def vm_metrics(self, ep: Endpoint, vm_ids: list[str]) -> dict[str, Any]:
+        return self.run(ep, "vm_metrics", {"ids": vm_ids})

@@ -64,6 +64,9 @@ def test_ps_script_build_and_parse():
     assert ei.value.code == "SCRIPT_ERROR"
     # stray pipeline output before the final hashtable
     assert parse_output(['HVDJSON:{"ok":true,"data":["x",{"a":1}]}'], [], "h") == {"a": 1}
+    with pytest.raises(HyperVError) as exc:
+        parse_output(['HVDJSON:{"ok":false,"error":"Access denied","line":57,"command":"Resize-VHD"}'], [], "h")
+    assert exc.value.code == "PS_ERROR" and "[line 57: Resize-VHD]" in str(exc.value)
 
 
 class _U:
@@ -129,3 +132,12 @@ def test_ps_scripts_wellformed():
         src = build_script(name)
         assert _ps_balanced(src) is None, (name, _ps_balanced(src))
         assert "$ArgsJson" in src and "return" in src
+
+
+def test_cli_hv_run_validation(capsys):
+    from hvdirector.cli import main
+
+    assert main(["hv-run", "nosuch"]) == 2
+    assert "vm_metrics" in capsys.readouterr().err
+    assert main(["hv-run", "ping", "--args", "{bad"]) == 2
+    assert main(["hv-run", "ping"]) == 2  # neither --cluster nor --address
