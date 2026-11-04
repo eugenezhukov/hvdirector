@@ -1,0 +1,27 @@
+[Unit]
+Description=HV Director worker (Hyper-V tasks and state sync)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=hvdirector
+Group=hvdirector
+EnvironmentFile=/etc/hvdirector/hvdirector.env
+WorkingDirectory=/opt/hvdirector
+ExecStart=/opt/hvdirector/venv/bin/python -m hvdirector.worker
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hvdirector
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

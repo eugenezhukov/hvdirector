@@ -1,0 +1,28 @@
+[Unit]
+Description=HV Director API (FastAPI / uvicorn)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=hvdirector
+Group=hvdirector
+EnvironmentFile=/etc/hvdirector/hvdirector.env
+WorkingDirectory=/opt/hvdirector
+ExecStart=/opt/hvdirector/venv/bin/uvicorn --factory hvdirector.main:create_app \
+    --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips 127.0.0.1 \
+    --timeout-keep-alive 30 --no-server-header
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hvdirector
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

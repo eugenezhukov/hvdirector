@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>VM Console - HV Director</title>
+  </head>
+  <body>
+    <div id="toolbar">
+      <span id="vm-name"></span>
+      <span id="status" class="status"></span>
+      <span class="spacer"></span>
+      <button id="btn-cad" type="button">Ctrl+Alt+Del</button>
+      <button id="btn-fit" type="button"></button>
+      <button id="btn-full" type="button"></button>
+      <button id="btn-reconnect" type="button" hidden></button>
+    </div>
+    <div id="screen" tabindex="0"></div>
+    <div id="overlay"><div id="overlay-text"></div></div>
+    <script type="module" src="/src/console/console.js"></script>
+  </body>
+</html>

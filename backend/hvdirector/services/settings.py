@@ -1,0 +1,60 @@
+"""Global settings stored in the database (JSON per key)."""
+
+from __future__ import annotations
+
+import copy
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from ..models import Setting
+
+DEFAULTS: dict[str, dict[str, Any]] = {
+    # ISO library: share reachable by all Hyper-V hosts (UNC path as seen by hosts).
+    # "server" optionally overrides the host part of the UNC path for the
+    # management server's own SMB connection (e.g. an IP address).
+    "iso_share": {
+        "backend": "smb",  # smb | local (local = development only)
+        "unc": "\\\\shared\\iso",
+        "server": "",
+        "username": "",
+        "password_enc": "",
+        "local_path": "/var/lib/hvdirector/iso",
+    },
+    "guacd": {"host": "127.0.0.1", "port": 4822},
+    "console": {"keyboard_layout": "en-us-qwerty", "ticket_ttl_s": 60},
+    "sync": {"interval_s": 60},
+    "security": {"session_idle_minutes": 480, "session_max_hours": 24, "max_failed_logins": 10,
+                 "lockout_minutes": 15},
+    "placement": {"memory_reserve_mb": 4096},
+}
+
+SECRET_FIELDS = {"iso_share": {"password_enc"}}
+
+
+def get_setting(db: Session, key: str) -> dict[str, Any]:
+    value = copy.deepcopy(DEFAULTS.get(key, {}))
+    row = db.get(Setting, key)
+    if row is not None and isinstance(row.value, dict):
+        value.update(row.value)
+    return value
+
+
+def set_setting(db: Session, key: str, value: dict[str, Any]) -> dict[str, Any]:
+    merged = get_setting(db, key)
+    merged.update(value)
+    row = db.get(Setting, key)
+    if row is None:
+        row = Setting(key=key, value=merged)
+        db.add(row)
+    else:
+        row.value = merged
+    return merged
+
+
+def public_setting(key: str, value: dict[str, Any]) -> dict[str, Any]:
+    """Setting without secret values (adds has_<field> flags)."""
+    out = dict(value)
+    for f in SECRET_FIELDS.get(key, set()):
+        out[f"has_{f.removesuffix('_enc')}"] = bool(out.pop(f, ""))
+    return out

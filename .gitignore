@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+build/
+frontend/node_modules/
+*.log
+.env
+*.env
+!deploy/hvdirector.env.example

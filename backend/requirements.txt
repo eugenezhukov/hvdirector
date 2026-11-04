@@ -1,0 +1,14 @@
+# Pinned runtime dependencies (tested with Python 3.13, Debian 13 ships 3.13)
+fastapi==0.162.0
+starlette==1.10.0
+uvicorn[standard]==0.54.0
+SQLAlchemy==2.1.8
+psycopg[binary]==3.3.8
+alembic==1.20.1
+pydantic==2.14.2
+argon2-cffi==25.1.0
+cryptography==50.0.2
+pypsrp[credssp]==0.9.1
+pyspnego==0.12.4
+requests-credssp==2.0.0
+smbprotocol==1.17.0

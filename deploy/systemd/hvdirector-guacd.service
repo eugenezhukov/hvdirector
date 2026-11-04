@@ -1,0 +1,21 @@
+[Unit]
+Description=Guacamole proxy daemon (guacd) for HV Director VM consoles
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=guacd
+Group=guacd
+# Listens on localhost only: the HV Director API is the only client.
+ExecStart=/usr/local/sbin/guacd -f -b 127.0.0.1 -l 4822 -L info
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/guacd
+
+[Install]
+WantedBy=multi-user.target

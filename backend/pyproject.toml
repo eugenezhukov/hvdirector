@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hvdirector"
+version = "0.1.0"
+description = "HV Director: multi-tenant self-service portal for Hyper-V clusters (Cloud Director-like, simplified)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "SQLAlchemy>=2.0.30",
+    "psycopg[binary]>=3.2",
+    "alembic>=1.13",
+    "pydantic>=2.7",
+    "argon2-cffi>=23.1",
+    "cryptography>=42",
+    "pypsrp[credssp]>=0.8.1",
+    "smbprotocol>=1.13",
+]
+
+[project.optional-dependencies]
+kerberos = ["pypsrp[kerberos]>=0.8.1"]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+hvdirector-manage = "hvdirector.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["hvdirector*"]
+
+[tool.setuptools.package-data]
+hvdirector = ["hyperv/scripts/*.ps1", "migrations/*.py", "migrations/*.mako", "migrations/versions/*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
