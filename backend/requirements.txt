@@ -12,3 +12,6 @@ pypsrp[credssp]==0.9.1
 pyspnego==0.12.4
 requests-credssp==2.0.0
 smbprotocol==1.17.0
+paramiko==5.1.0
+bcrypt==5.0.0
+PyNaCl==1.6.2

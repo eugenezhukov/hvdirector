@@ -24,6 +24,7 @@ os.environ["HVD_FAKE_DELAY"] = "0"
 os.environ["HVD_COOKIE_SECURE"] = "false"
 os.environ["HVD_FRONTEND_DIST"] = os.path.join(_tmp, "no-dist")
 os.environ["HVD_LOG_LEVEL"] = "WARNING"
+os.environ["HVD_DATA_DIR"] = os.path.join(_tmp, "data")
 
 TMP_DIR = _tmp
 

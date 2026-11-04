@@ -134,3 +134,25 @@ function Get-HvdClusterInfo {
     if ($c.Domain) { $fqdn = ("{0}.{1}" -f $c.Name, $c.Domain) }
     return @{ name = [string]$c.Name; domain = [string]$c.Domain; fqdn = $fqdn; address = $cip; nodes = $nodes; csvs = $csvs }
 }
+
+function Set-HvdNicVlan($nic, $n) {
+    # mode: access (default, uses $n.vlan; no VLAN = untagged) | trunk (allowed = "100,101,200-210")
+    if ([string]$n.mode -eq 'trunk') {
+        $allowed = [string]$n.allowed
+        if (-not $allowed) { $allowed = '4094' }
+        Set-VMNetworkAdapterVlan -VMNetworkAdapter $nic -Trunk -AllowedVlanIdList $allowed -NativeVlanId 0
+    } elseif ($n.vlan) {
+        Set-VMNetworkAdapterVlan -VMNetworkAdapter $nic -Access -VlanId ([int]$n.vlan)
+    } else {
+        Set-VMNetworkAdapterVlan -VMNetworkAdapter $nic -Untagged
+    }
+}
+
+function Set-HvdNicSwitch($nic, $n) {
+    # connected = $false keeps the adapter disconnected (no link in the guest)
+    if ($n.switch -and ($n.connected -ne $false)) {
+        if ([string]$nic.SwitchName -ne [string]$n.switch) { Connect-VMNetworkAdapter -VMNetworkAdapter $nic -SwitchName ([string]$n.switch) }
+    } elseif ($nic.SwitchName) {
+        Disconnect-VMNetworkAdapter -VMNetworkAdapter $nic
+    }
+}

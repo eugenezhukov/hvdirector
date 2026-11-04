@@ -97,7 +97,7 @@ def require_tenant_perm(principal: Principal, perm: str) -> None:
 
 def get_vm_for(db: Session, principal: Principal, vm_id: uuid.UUID, perm: str = "vm.view") -> VM:
     vm = db.get(VM, vm_id)
-    if vm is None or vm.tenant_id != principal.tenant_id:
+    if vm is None or vm.tenant_id != principal.tenant_id or vm.kind != "vm":
         raise NotFound("vm")
     if not principal.has_vm_perm("vm.view", vm.id):
         raise NotFound("vm")

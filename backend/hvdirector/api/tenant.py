@@ -14,10 +14,12 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..errors import AppError, Conflict, Forbidden, NotFound
-from ..models import (VM, ConsoleTicket, Datastore, Iso, Network, Snapshot, StorageClass, Task, TenantStorageQuota,
-                      TenantVlan, User, VMDisk, VMNic, utcnow)
+from ..models import (VM, ConsoleTicket, Datastore, Iso, Network, Router, RouterNetwork, Snapshot, StorageClass, Task,
+                      TenantStorageQuota, TenantVlan, User, VMDisk, VMNic, utcnow)
 from ..security import hash_token, new_token
 from ..services import isos as iso_svc
+from ..services import netutil
+from ..services import routers as rsvc
 from ..services import users as user_svc
 from ..services.audit import log_event
 from ..services.quotas import Delta, check_quota, lock_tenant, quota_report
@@ -34,7 +36,7 @@ POWER_ACTIONS = {"start", "shutdown", "poweroff", "reset", "reboot", "save"}
 
 
 def _visible_vms_query(p: Principal):
-    q = select(VM).where(VM.tenant_id == p.tenant_id)
+    q = select(VM).where(VM.tenant_id == p.tenant_id, VM.kind == "vm")
     if not p.sees_all_vms():
         ids = p.scoped_vm_ids()
         q = q.where(VM.id.in_(ids or {uuid.uuid4()}))
@@ -466,7 +468,9 @@ def list_networks(p: Principal = Depends(tenant_user), db: Session = Depends(get
     rows = db.scalars(select(Network).where(Network.tenant_id == p.tenant_id).order_by(Network.name)).all()
     counts = dict(db.execute(select(VMNic.network_id, func.count(VMNic.id)).where(
         VMNic.network_id.in_([n.id for n in rows] or [uuid.uuid4()])).group_by(VMNic.network_id)).all())
-    return [network_to_dict(n, counts.get(n.id, 0)) for n in rows]
+    routed = set(db.scalars(select(RouterNetwork.network_id).join(Router, Router.id == RouterNetwork.router_id)
+                            .where(Router.tenant_id == p.tenant_id)).all())
+    return [network_to_dict(n, counts.get(n.id, 0), n.id in routed) for n in rows]
 
 
 @router.get("/vlans")
@@ -500,8 +504,13 @@ def create_network(body: NetworkIn, p: Principal = Depends(tenant_user), db: Ses
         if not free:
             raise Conflict("no_free_vlan", "No free VLAN left in the organization pool")
         vlan = free[0]
+    cidr = str(netutil.parse_cidr(body.cidr, "cidr")) if body.cidr else None
+    if body.gateway:
+        if not cidr:
+            raise AppError("network_needs_gateway", "Set the subnet (CIDR) together with the gateway", network=name)
+        netutil.parse_interface(body.gateway, cidr)
     net = Network(tenant_id=p.tenant_id, name=name, vlan_id=vlan, description=body.description,
-                  cidr=body.cidr or None, gateway=body.gateway or None, dns=body.dns or None)
+                  cidr=cidr, gateway=body.gateway or None, dns=body.dns or None)
     db.add(net)
     log_event(db, "network.created", user=p.user, target_type="network", target_name=name, ip=p.ip,
               details={"vlan": vlan})
@@ -526,6 +535,18 @@ def update_network(net_id: uuid.UUID, body: NetworkUpdateIn, p: Principal = Depe
         value = getattr(body, field)
         if value is not None:
             setattr(net, field, value or ("" if field == "description" else None))
+    if net.cidr:
+        net.cidr = str(netutil.parse_cidr(net.cidr, "cidr"))
+    if net.gateway:
+        if not net.cidr:
+            raise AppError("network_needs_gateway", "Set the subnet (CIDR) together with the gateway",
+                           network=net.name)
+        netutil.parse_interface(net.gateway, net.cidr)
+    r = db.scalar(select(Router).where(Router.tenant_id == p.tenant_id))
+    if r is not None and any(rn.network_id == net.id for rn in r.networks):
+        db.flush()
+        rsvc.validate_networks_for_router(db, p.tenant_id, [rn.network_id for rn in r.networks])
+        rsvc.bump(db, r, p.user)
     db.commit()
     return network_to_dict(net)
 
@@ -537,6 +558,11 @@ def delete_network(net_id: uuid.UUID, p: Principal = Depends(tenant_user), db: S
     users = db.scalars(select(VM.name).join(VMNic, VMNic.vm_id == VM.id).where(VMNic.network_id == net.id)).all()
     if users:
         raise Conflict("network_in_use", "Network is used by VMs", vms=", ".join(sorted(set(users))))
+    if db.scalar(select(RouterNetwork).where(RouterNetwork.network_id == net.id)):
+        raise Conflict("network_on_router", "Disconnect the network from the router first")
+    rules = rsvc.rules_referencing(db, p.tenant_id, "network", str(net.id))
+    if rules:
+        raise Conflict("network_in_rules", "The network is used by firewall rules", rules=", ".join(rules))
     log_event(db, "network.deleted", user=p.user, target_type="network", target_name=net.name, ip=p.ip,
               details={"vlan": net.vlan_id})
     db.delete(net)

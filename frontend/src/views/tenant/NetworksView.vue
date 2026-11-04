@@ -17,7 +17,9 @@
         <span class="muted">{{ t('networks.freeVlans', { n: freeVlans.length }) }}</span>
       </div>
       <el-table v-loading="loading" :data="items" :empty-text="t('common.noData')">
-        <el-table-column prop="name" :label="t('common.name')" min-width="160" />
+        <el-table-column :label="t('common.name')" min-width="160">
+          <template #default="{ row }">{{ row.name }} <el-tag v-if="row.on_router" size="small" type="success">{{ t('nav.edge') }}</el-tag></template>
+        </el-table-column>
         <el-table-column prop="vlan_id" label="VLAN" width="90" />
         <el-table-column :label="t('networks.cidr')" width="160"><template #default="{ row }"><span class="mono">{{ row.cidr || '—' }}</span></template></el-table-column>
         <el-table-column :label="t('networks.gateway')" width="140"><template #default="{ row }"><span class="mono">{{ row.gateway || '—' }}</span></template></el-table-column>

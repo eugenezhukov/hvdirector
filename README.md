@@ -30,6 +30,7 @@ VMware Cloud Director. Провайдер подключает кластеры 
 | 10 | Привязка тенанта к кластеру, авторазмещение + HA | Организация привязана к кластеру. ВМ создаётся на узле с наибольшим запасом свободной памяти и регистрируется ролью кластера (`Add-ClusterVirtualMachineRole`). Перемещение ВМ (live migration, failover) отслеживается автоматически |
 | 11 | Всё на одной машине без Docker | `deploy/install.sh` ставит PostgreSQL, nginx, Python venv, guacd (сборка из исходников), systemd-юниты |
 | 12 | Все креды и IP в БД | В БД: адреса узлов и кластера, учётные данные WinRM, консоли и шары ISO (шифрование Fernet), адрес guacd. Вне БД только строка подключения к PostgreSQL и мастер-ключ |
+| 13 | Виртуальные раутеры (Edge) | Раутер организации — ВМ с Debian 13, ставится автоматически из ISO провайдера (preseed, xorriso). Management в глобальной таблице (SSH от HV Director), WAN и сети тенанта в VRF; сети подключаются VLAN-интерфейсами (SVI) на trunk. Firewall stateful/stateless, SNAT/DNAT, списки IP, явные TCP/UDP-порты. Подробнее: [docs/routers.md](docs/routers.md) |
 
 ## Архитектура
 
@@ -105,6 +106,10 @@ sudo -u hvdirector bash -c 'set -a; . /etc/hvdirector/hvdirector.env; /opt/hvdir
 ```bash
 journalctl -u hvdirector-api -u hvdirector-worker -u hvdirector-guacd -f
 ```
+
+## Виртуальные раутеры
+
+Провайдер описывает внешние сети (WAN и OOB management), выдаёт организации WAN-адреса и management IP и выбирает ISO Debian 13; тенант создаёт раутер кнопкой, подключает к нему свои сети и настраивает firewall, NAT и списки IP. Архитектура, сетевые требования и семантика правил — в **[docs/routers.md](docs/routers.md)**.
 
 ## Подготовка Hyper-V
 
@@ -213,5 +218,6 @@ docs/                 подготовка Hyper-V
 * Память статическая (Dynamic Memory не используется), квота считается по выделенной памяти.
 * IP-адресация сетей справочная (без IPAM/DHCP); маршрутизация между VLAN — на стороне сети.
 * Провайдер видит ВМ организаций только для чтения.
+* Раутеры: один на организацию, IPv4, без VPN/DHCP/статических маршрутов (см. docs/routers.md).
 * Сборка guacd проверена с FreeRDP 3 на Ubuntu 24.04. На Debian 13 используются те же флаги сборки,
   но установщик на чистом Debian 13 в рамках этой разработки не запускался.

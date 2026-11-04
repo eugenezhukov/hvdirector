@@ -28,6 +28,10 @@ images, take snapshots and open VM consoles in the browser.
 * **Console**: guacamole-common-js in an iframe popup; the backend tunnels the WebSocket to guacd, which
   speaks RDP in `vmconnect` mode to port 2179 of the node owning the VM. Host credentials never reach the
   browser; one-time tickets.
+* **Virtual routers (Edge)**: a Debian 13 VM per organization installed unattended from the provider ISO;
+  management in the global table (SSH from HV Director), WAN and tenant networks in a VRF, networks attached
+  as VLAN SVIs on a trunk; stateful/stateless firewall, SNAT/DNAT, IP sets, explicit TCP/UDP ports.
+  See [docs/routers.md](docs/routers.md) (Russian).
 * **UI in Russian and English**, task panel and audit log.
 * **Everything on one Debian 13 machine without Docker**; host addresses and credentials live in
   PostgreSQL (credentials encrypted with a master key).

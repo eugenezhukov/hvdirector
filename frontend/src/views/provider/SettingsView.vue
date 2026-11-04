@@ -54,6 +54,7 @@
             <el-form-item><el-button type="primary" @click="saveMany(['sync', 'placement'])">{{ t('common.save') }}</el-button></el-form-item>
           </el-form>
         </div>
+        <RouterSettingsCard />
         <div class="card">
           <h3>{{ t('settings.security') }}</h3>
           <el-form label-width="290px">
@@ -75,6 +76,7 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { api } from '../../api'
 import { errorText } from '../../i18n'
+import RouterSettingsCard from '../../components/RouterSettingsCard.vue'
 
 const { t } = useI18n()
 const s = ref(null)

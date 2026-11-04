@@ -78,9 +78,10 @@ def tenant_to_dict(t: Tenant, extra: dict[str, Any] | None = None) -> dict[str, 
     return out
 
 
-def network_to_dict(n: Network, nic_count: int = 0) -> dict[str, Any]:
+def network_to_dict(n: Network, nic_count: int = 0, on_router: bool = False) -> dict[str, Any]:
     return {"id": str(n.id), "name": n.name, "vlan_id": n.vlan_id, "description": n.description, "cidr": n.cidr,
-            "gateway": n.gateway, "dns": n.dns, "nic_count": nic_count, "created_at": _iso(n.created_at)}
+            "gateway": n.gateway, "dns": n.dns, "nic_count": nic_count, "on_router": on_router,
+            "created_at": _iso(n.created_at)}
 
 
 def iso_to_dict(i: Iso) -> dict[str, Any]:
@@ -106,7 +107,7 @@ VM_ACTIONS = {
 
 def vm_to_dict(vm: VM, principal: Principal | None = None, detail: bool = False) -> dict[str, Any]:
     out: dict[str, Any] = {
-        "id": str(vm.id), "name": vm.name, "description": vm.description, "hv_name": vm.hv_name,
+        "id": str(vm.id), "name": vm.name, "kind": vm.kind, "description": vm.description, "hv_name": vm.hv_name,
         "tenant_id": str(vm.tenant_id), "tenant": vm.tenant.slug if vm.tenant else None,
         "cluster_id": str(vm.cluster_id), "cluster": vm.cluster.name if vm.cluster else None,
         "host": vm.host.name if vm.host else None, "generation": vm.generation, "secure_boot": vm.secure_boot,
@@ -149,3 +150,68 @@ def event_to_dict(e: Event) -> dict[str, Any]:
             "target_type": e.target_type, "target_id": e.target_id, "target_name": e.target_name,
             "status": e.status, "details": e.details, "ip": e.ip,
             "tenant_id": str(e.tenant_id) if e.tenant_id else None}
+
+
+# ---------------------------------------------------------------------------
+# Virtual routers
+# ---------------------------------------------------------------------------
+
+
+def extnet_to_dict(n, allocated: int = 0) -> dict[str, Any]:  # noqa: ANN001
+    import ipaddress as _ip
+
+    net = _ip.IPv4Network(n.cidr, strict=False)
+    usable = max(0, net.num_addresses - (2 if net.prefixlen < 31 else 0) - (1 if n.gateway else 0))
+    return {"id": str(n.id), "name": n.name, "purpose": n.purpose, "vlan_id": n.vlan_id, "cidr": n.cidr,
+            "gateway": n.gateway, "dns": n.dns, "vswitch_name": n.vswitch_name, "description": n.description,
+            "allocated": allocated, "usable": usable, "created_at": _iso(n.created_at)}
+
+
+def extip_to_dict(i, tenant_slug: str | None = None, used_by: list[str] | None = None) -> dict[str, Any]:  # noqa: ANN001
+    return {"id": str(i.id), "network_id": str(i.network_id), "network": i.network.name, "purpose": i.network.purpose,
+            "vlan_id": i.network.vlan_id, "cidr": i.network.cidr, "address": i.address,
+            "tenant_id": str(i.tenant_id), "tenant": tenant_slug, "description": i.description,
+            "used_by": used_by or [], "created_at": _iso(i.created_at)}
+
+
+def ipset_to_dict(s, used_by: list[str] | None = None) -> dict[str, Any]:  # noqa: ANN001
+    return {"id": str(s.id), "name": s.name, "description": s.description, "entries": s.entries,
+            "used_by": used_by or [], "created_at": _iso(s.created_at)}
+
+
+def fwrule_to_dict(r) -> dict[str, Any]:  # noqa: ANN001
+    return {"id": str(r.id), "position": r.position, "name": r.name, "enabled": r.enabled, "action": r.action,
+            "protocol": r.protocol, "sources": r.sources, "destinations": r.destinations, "src_ports": r.src_ports,
+            "dst_ports": r.dst_ports, "log": r.log, "description": r.description}
+
+
+def natrule_to_dict(r) -> dict[str, Any]:  # noqa: ANN001
+    return {"id": str(r.id), "position": r.position, "name": r.name, "enabled": r.enabled, "kind": r.kind,
+            "external_ip_id": str(r.external_ip_id), "external_ip": r.external_ip.address if r.external_ip else None,
+            "internal_address": r.internal_address, "protocol": r.protocol, "external_port": r.external_port,
+            "internal_port": r.internal_port, "match_address": r.match_address, "log": r.log,
+            "description": r.description}
+
+
+def router_to_dict(r, provider: bool = False, wan: dict[str, Any] | None = None) -> dict[str, Any]:  # noqa: ANN001
+    vm = r.vm
+    out: dict[str, Any] = {
+        "id": str(r.id), "name": r.name, "status": r.status, "status_message": r.status_message,
+        "tenant_id": str(r.tenant_id), "tenant": r.tenant.slug if r.tenant else None,
+        "firewall_stateful": r.firewall_stateful, "firewall_default_action": r.firewall_default_action,
+        "firewall_log_default": r.firewall_log_default, "config_version": r.config_version,
+        "applied_version": r.applied_version, "last_applied_at": _iso(r.last_applied_at), "last_error": r.last_error,
+        "storage_class": r.storage_class.name if r.storage_class else None,
+        "networks": [{"id": str(rn.network.id), "name": rn.network.name, "vlan_id": rn.network.vlan_id,
+                      "cidr": rn.network.cidr, "gateway": rn.network.gateway}
+                     for rn in sorted(r.networks, key=lambda x: x.network.vlan_id)],
+        "vm": {"id": str(vm.id), "status": vm.status, "power_state": vm.power_state, "vcpu": vm.vcpu,
+               "memory_mb": vm.memory_mb, "disk_gb": sum(d.size_gb for d in vm.disks)} if vm else None,
+        "wan": wan, "rules": len(r.firewall_rules), "nat_rules": len(r.nat_rules), "created_at": _iso(r.created_at),
+    }
+    if provider:
+        out["mgmt_ip"] = r.mgmt_ip.address if r.mgmt_ip else None
+        out["mgmt_vlan"] = r.mgmt_ip.network.vlan_id if r.mgmt_ip else None
+        out["vm"] = out["vm"] and {**out["vm"], "hv_name": vm.hv_name, "host": vm.host.name if vm.host else None,
+                                   "cluster": vm.cluster.name if vm.cluster else None, "hv_id": vm.hv_id}
+    return out

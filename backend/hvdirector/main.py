@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import text
 
 from . import __version__
-from .api import auth, common, console, provider, tenant
+from .api import auth, common, console, edge, provider, provider_edge, tenant
 from .config import get_config
 from .db import SessionLocal
 from .errors import AppError
@@ -35,7 +35,8 @@ def create_app() -> FastAPI:
     app = FastAPI(title="HV Director", version=__version__, docs_url="/api/docs", redoc_url=None,
                   openapi_url="/api/openapi.json")
 
-    for r in (auth.router, provider.router, tenant.router, common.router, console.router):
+    for r in (auth.router, provider.router, provider_edge.router, tenant.router, edge.router, common.router,
+              console.router):
         app.include_router(r)
 
     @app.exception_handler(AppError)

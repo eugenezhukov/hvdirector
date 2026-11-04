@@ -232,21 +232,27 @@ def _merge_snapshots(db: Session, vm: VM, snaps: list[dict[str, Any]]) -> None:
             db.delete(s)
 
 
+def delete_vm_resources(db: Session, driver: HyperVDriver, vm: VM) -> None:
+    """Remove the VM, its cluster role, disks and folders from Hyper-V."""
+    args = {"id": vm.hv_id, "group": vm.cluster_group, "disk_paths": [d.path for d in vm.disks if d.path],
+            "folders": vm_folders(vm)}
+    if not vm.hv_id:
+        return
+    try:
+        run_on_vm(db, driver, vm, lambda ep: driver.delete_vm(ep, args))
+    except HyperVError as exc:
+        if exc.code != "VM_NOT_FOUND":
+            raise
+        # VM vanished from Hyper-V: clean up files from any node.
+        host = next((h for h in vm.cluster.hosts if h.in_cluster and h.state in UP_STATES), None)
+        if host is not None:
+            driver.delete_vm(endpoint_for(vm.cluster, host), dict(args, id=None))
+
+
 @handler("vm.delete")
 def vm_delete(db: Session, driver: HyperVDriver, task: Task, ctx: TaskContext) -> dict[str, Any]:
     vm = _vm(db, task)
-    args = {"id": vm.hv_id, "group": vm.cluster_group, "disk_paths": [d.path for d in vm.disks if d.path],
-            "folders": vm_folders(vm)}
-    if vm.hv_id:
-        try:
-            run_on_vm(db, driver, vm, lambda ep: driver.delete_vm(ep, args))
-        except HyperVError as exc:
-            if exc.code != "VM_NOT_FOUND":
-                raise
-            # VM vanished from Hyper-V: clean up files from any node.
-            host = next((h for h in vm.cluster.hosts if h.in_cluster and h.state in UP_STATES), None)
-            if host is not None:
-                driver.delete_vm(endpoint_for(vm.cluster, host), dict(args, id=None))
+    delete_vm_resources(db, driver, vm)
     name, tenant_id, vm_id = vm.name, vm.tenant_id, vm.id
     db.delete(vm)
     log_event(db, "vm.deleted", username=task.username, tenant_id=tenant_id, target_type="vm", target_id=vm_id,

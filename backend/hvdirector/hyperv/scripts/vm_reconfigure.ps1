@@ -1,4 +1,5 @@
-# $A: id, vcpu, memory_mb, add_disks: [{path, size_gb}], nics: [{op: add|set|remove, name, switch, vlan}]
+# $A: id, vcpu, memory_mb, add_disks: [{path, size_gb}],
+#     nics: [{op: add|set|remove, name, switch, vlan, mode, allowed, mac, connected}]
 $vm = Get-HvdVm ([string]$A.id)
 if ($A.vcpu -or $A.memory_mb) {
     if ([string]$vm.State -ne 'Off') { Fail 'VM_MUST_BE_OFF' 'Power off the VM to change vCPU or memory' }
@@ -19,17 +20,15 @@ foreach ($n in $A.nics) {
     switch ([string]$n.op) {
         'add' {
             $nic = Add-VMNetworkAdapter -VM $vm -Name ([string]$n.name) -Passthru
-            if ($n.switch) { Connect-VMNetworkAdapter -VMNetworkAdapter $nic -SwitchName ([string]$n.switch) }
-            if ($n.vlan) { Set-VMNetworkAdapterVlan -VMNetworkAdapter $nic -Access -VlanId ([int]$n.vlan) }
+            if ($n.mac) { Set-VMNetworkAdapter -VMNetworkAdapter $nic -StaticMacAddress ([string]$n.mac) }
+            Set-HvdNicSwitch $nic $n
+            Set-HvdNicVlan $nic $n
             $nicOut += @{ name = [string]$nic.Name; mac = [string]$nic.MacAddress }
         }
         'set' {
             $nic = Get-VMNetworkAdapter -VM $vm -Name ([string]$n.name) -ErrorAction Stop | Select-Object -First 1
-            if ($n.switch) {
-                if ([string]$nic.SwitchName -ne [string]$n.switch) { Connect-VMNetworkAdapter -VMNetworkAdapter $nic -SwitchName ([string]$n.switch) }
-            } else { Disconnect-VMNetworkAdapter -VMNetworkAdapter $nic }
-            if ($n.vlan) { Set-VMNetworkAdapterVlan -VMNetworkAdapter $nic -Access -VlanId ([int]$n.vlan) }
-            else { Set-VMNetworkAdapterVlan -VMNetworkAdapter $nic -Untagged }
+            Set-HvdNicSwitch $nic $n
+            Set-HvdNicVlan $nic $n
         }
         'remove' {
             Get-VMNetworkAdapter -VM $vm -Name ([string]$n.name) -ErrorAction SilentlyContinue | Remove-VMNetworkAdapter

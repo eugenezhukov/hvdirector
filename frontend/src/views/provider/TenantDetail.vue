@@ -47,6 +47,9 @@
           <el-table-column :label="t('vms.disk')" width="100"><template #default="{ row }">{{ fmtGb(row.disk_gb) }}</template></el-table-column>
         </el-table>
       </el-tab-pane>
+      <el-tab-pane :label="t('extnet.tenantTab')" name="extips" lazy>
+        <TenantExternalIps :tenant-id="tn.id" />
+      </el-tab-pane>
       <el-tab-pane :label="`${t('tenants.users')} (${users.length})`" name="users">
         <div class="toolbar"><span class="spacer" /><el-button size="small" @click="udlg.open()"><el-icon><IconPlus /></el-icon>{{ t('users.add') }}</el-button></div>
         <el-table :data="users" size="small">
@@ -89,6 +92,7 @@ import { errorText } from '../../i18n'
 import QuotaBar from '../../components/QuotaBar.vue'
 import TenantDialog from '../../components/TenantDialog.vue'
 import UserDialog from '../../components/UserDialog.vue'
+import TenantExternalIps from '../../components/TenantExternalIps.vue'
 import VmState from '../../components/VmState.vue'
 import { fmtGb, fmtMb } from '../../utils/format'
 

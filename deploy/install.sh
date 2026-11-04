@@ -62,11 +62,11 @@ export DEBIAN_FRONTEND=noninteractive
 log "Installing system packages"
 apt-get update -q
 apt-get install -y --no-install-recommends \
-    postgresql nginx python3 python3-venv openssl curl ca-certificates rsync
+    postgresql nginx python3 python3-venv openssl curl ca-certificates rsync xorriso
 
 # ---------------------------------------------------------------- user, dirs
 id "$SVC_USER" >/dev/null 2>&1 || useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$SVC_USER"
-install -d -o "$SVC_USER" -g "$SVC_USER" -m 0750 "$DATA_DIR" "$DATA_DIR/iso"
+install -d -o "$SVC_USER" -g "$SVC_USER" -m 0750 "$DATA_DIR" "$DATA_DIR/iso" "$DATA_DIR/cache" "$DATA_DIR/tmp"
 install -d -o root -g "$SVC_USER" -m 0750 "$CONF_DIR" "$CONF_DIR/tls"
 install -d -m 0755 "$APP_DIR" "$APP_DIR/app" "$APP_DIR/app/frontend"
 

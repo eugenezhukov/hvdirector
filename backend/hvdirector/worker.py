@@ -21,6 +21,7 @@ from .db import SessionLocal
 from .hyperv import HyperVError, get_driver
 from .logging_setup import setup_logging
 from .models import Task, UserSession, ConsoleTicket, Iso, utcnow
+from .services import routers as _routers  # noqa: F401 - registers router task handlers
 from .services import vmops
 from .services.isostore import IsoStore
 from .services.settings import get_setting

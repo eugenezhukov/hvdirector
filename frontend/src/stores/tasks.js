@@ -24,7 +24,13 @@ export const useTasks = defineStore('tasks', {
         if (!t) {
           try {
             t = await api.get(`/api/tasks/${id}`)
-          } catch {
+          } catch (e) {
+            if (e.status === 404) {
+              // not a task (or not visible to this user): stop watching it
+              const w = this.watchers[id]
+              delete this.watchers[id]
+              if (w) w({ id, status: 'error', kind: '', message: 'not found' })
+            }
             continue
           }
         }

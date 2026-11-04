@@ -78,7 +78,7 @@ def set_roles(db: Session, user: User, roles: list[dict[str, Any]]) -> None:
         vm_id = uuid.UUID(str(r["vm_id"])) if r.get("vm_id") else None
         if vm_id is not None:
             vm = db.get(VM, vm_id)
-            if vm is None or vm.tenant_id != user.tenant_id:
+            if vm is None or vm.tenant_id != user.tenant_id or vm.kind != "vm":
                 raise NotFound("vm")
         wanted.add((role, vm_id))
     current = {(a.role, a.vm_id): a for a in user.roles}

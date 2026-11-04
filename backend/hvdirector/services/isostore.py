@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from typing import Any
 
@@ -109,6 +110,36 @@ class IsoStore:
             if "STATUS_OBJECT_NAME_NOT_FOUND" in str(exc):
                 return
             raise AppError("iso_share_error", f"Cannot delete file on ISO share: {exc}") from exc
+
+    COPY_CHUNK = 4 * 1024 * 1024
+
+    def download(self, file_name: str, local_path: str) -> None:
+        """Copy an image from the share to a local file (used to remaster router installers)."""
+        if self.backend == "local":
+            shutil.copyfile(self._local(file_name), local_path)
+            return
+        import smbclient
+
+        try:
+            with smbclient.open_file(self._smb_path(file_name), mode="rb", **self._smb_kwargs()) as src, \
+                    open(local_path, "wb") as dst:
+                shutil.copyfileobj(src, dst, self.COPY_CHUNK)
+        except Exception as exc:  # noqa: BLE001
+            raise AppError("iso_share_error", f"Cannot read {file_name} from ISO share: {exc}") from exc
+
+    def upload(self, local_path: str, file_name: str) -> None:
+        if self.backend == "local":
+            os.makedirs(self.local_path, exist_ok=True)
+            shutil.copyfile(local_path, self._local(file_name))
+            return
+        import smbclient
+
+        try:
+            with open(local_path, "rb") as src, \
+                    smbclient.open_file(self._smb_path(file_name), mode="wb", **self._smb_kwargs()) as dst:
+                shutil.copyfileobj(src, dst, self.COPY_CHUNK)
+        except Exception as exc:  # noqa: BLE001
+            raise AppError("iso_share_error", f"Cannot write {file_name} to ISO share: {exc}") from exc
 
     def test(self) -> dict[str, Any]:
         """Write and remove a probe file; returns free space when available."""

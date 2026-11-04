@@ -76,6 +76,10 @@ New-VMSwitch -Name "vSwitch-Tenants" -NetAdapterName "Trunk" -AllowManagementOS 
 HV Director переводит адаптер ВМ в режим access нужного VLAN:
 `Set-VMNetworkAdapterVlan -Access -VlanId <VLAN сети>`.
 
+Виртуальные раутеры используют тот же коммутатор: LAN-адаптер раутера работает в режиме trunk
+(`Set-VMNetworkAdapterVlan -Trunk -AllowedVlanIdList ...`), WAN и management — в режиме access VLAN внешних сетей.
+VLAN внешних сетей (WAN, OOB management) тоже должны приходить на trunk-порты узлов. Подробнее — [routers.md](routers.md).
+
 ## 5. Хранилища (CSV / SMB3)
 
 * В кластере используйте Cluster Shared Volumes (`C:\ClusterStorage\VolumeN`) или SMB3-шару

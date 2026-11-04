@@ -1,7 +1,7 @@
 # Create a VM on the local host.
-# $A: name, generation, vcpu, memory_mb, path (folder that will contain the VM folder), notes,
+# $A: name, generation, vcpu, memory_mb, path (folder that will contain the VM folder), notes, boot_disk_first,
 #     secure_boot (off|windows|linux), iso (UNC path or null),
-#     disks: [{path, size_gb}], nics: [{name, switch, vlan}]
+#     disks: [{path, size_gb}], nics: [{name, switch, vlan, mode, allowed, mac, connected}]
 $name = [string]$A.name
 if (Get-VM -Name $name -ErrorAction SilentlyContinue) { Fail 'VM_EXISTS' ("VM '{0}' already exists on {1}" -f $name, $env:COMPUTERNAME) }
 $gen = [int]$A.generation
@@ -44,8 +44,10 @@ try {
     $nicOut = @()
     foreach ($n in $A.nics) {
         $nic = Add-VMNetworkAdapter -VM $vm -Name ([string]$n.name) -Passthru
-        if ($n.switch) { Connect-VMNetworkAdapter -VMNetworkAdapter $nic -SwitchName ([string]$n.switch) }
-        if ($n.vlan) { Set-VMNetworkAdapterVlan -VMNetworkAdapter $nic -Access -VlanId ([int]$n.vlan) }
+        if ($n.mac) { Set-VMNetworkAdapter -VMNetworkAdapter $nic -StaticMacAddress ([string]$n.mac) }
+        Set-HvdNicSwitch $nic $n
+        Set-HvdNicVlan $nic $n
+        $nic = Get-VMNetworkAdapter -VM $vm -Name ([string]$n.name) | Select-Object -First 1
         $nicOut += @{ name = [string]$nic.Name; mac = [string]$nic.MacAddress }
     }
 
@@ -59,10 +61,17 @@ try {
         $fwDvd = Get-VMDvdDrive -VM $vm | Select-Object -First 1
         $net = Get-VMNetworkAdapter -VM $vm | Select-Object -First 1
         $order = @()
-        if ($A.iso -and $fwDvd) { $order += $fwDvd }
-        if ($hdd) { $order += $hdd }
-        if ((-not $A.iso) -and $fwDvd) { $order += $fwDvd }
-        if ($net) { $order += $net }
+        if ($A.boot_disk_first) {
+            # Empty disk is skipped by UEFI, so the installer boots from DVD; after the
+            # installation the VM boots from disk without ejecting the media first.
+            if ($hdd) { $order += $hdd }
+            if ($fwDvd) { $order += $fwDvd }
+        } else {
+            if ($A.iso -and $fwDvd) { $order += $fwDvd }
+            if ($hdd) { $order += $hdd }
+            if ((-not $A.iso) -and $fwDvd) { $order += $fwDvd }
+            if ($net) { $order += $net }
+        }
         if ($order.Count -gt 0) { Set-VMFirmware -VM $vm -BootOrder $order }
     } else {
         if ($A.iso) { Set-VMBios -VM $vm -StartupOrder @('CD', 'IDE', 'LegacyNetworkAdapter', 'Floppy') }

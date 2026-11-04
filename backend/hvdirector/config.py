@@ -46,6 +46,7 @@ class AppConfig:
     fake_state_file: str
     worker_threads: int
     upload_chunk_mb: int
+    data_dir: str
 
 
 def _bool(value: str | None, default: bool) -> bool:
@@ -78,4 +79,5 @@ def get_config() -> AppConfig:
         fake_state_file=os.environ.get("HVD_FAKE_STATE", "/var/lib/hvdirector/fake-hyperv.json"),
         worker_threads=int(os.environ.get("HVD_WORKER_THREADS", "8")),
         upload_chunk_mb=int(os.environ.get("HVD_UPLOAD_CHUNK_MB", "16")),
+        data_dir=os.environ.get("HVD_DATA_DIR", "/var/lib/hvdirector"),
     )

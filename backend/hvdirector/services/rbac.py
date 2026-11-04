@@ -25,8 +25,8 @@ VM_PERMS: dict[str, set[str]] = {
 
 TENANT_PERMS: dict[str, set[str]] = {
     "tenant_admin": {"tenant.view", "vm.create", "network.view", "network.manage", "iso.view", "iso.manage",
-                     "user.view", "user.manage", "task.view", "event.view"},
-    "audit": {"tenant.view", "network.view", "iso.view", "user.view", "task.view", "event.view"},
+                     "user.view", "user.manage", "task.view", "event.view", "router.view", "router.manage"},
+    "audit": {"tenant.view", "network.view", "iso.view", "user.view", "task.view", "event.view", "router.view"},
     "console": set(),
 }
 

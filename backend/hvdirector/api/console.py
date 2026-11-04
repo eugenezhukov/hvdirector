@@ -68,7 +68,9 @@ def prepare_console(token: str | None, ticket: str | None, ip: str) -> dict[str,
         row.used = True
         db.commit()
         vm = db.get(VM, row.vm_id)
-        if vm is None or vm.tenant_id != principal.tenant_id or not principal.has_vm_perm("vm.console", vm.id):
+        allowed = vm is not None and (principal.is_provider or (
+            vm.tenant_id == principal.tenant_id and vm.kind == "vm" and principal.has_vm_perm("vm.console", vm.id)))
+        if not allowed:
             raise ConsoleDenied("Access to this VM console is denied", FORBIDDEN)
         if not vm.hv_id:
             raise ConsoleDenied("VM is not provisioned", UPSTREAM_NOT_FOUND)

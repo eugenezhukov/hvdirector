@@ -74,6 +74,8 @@ const menu = computed(() => {
       { group: t('nav.infrastructure') },
       { path: `${b}/clusters`, label: t('nav.clusters'), icon: 'IconCpu' },
       { path: `${b}/storage`, label: t('nav.storage'), icon: 'IconCoin' },
+      { path: `${b}/external-networks`, label: t('nav.extnets'), icon: 'IconShare' },
+      { path: `${b}/routers`, label: t('nav.routers'), icon: 'IconPosition' },
       { path: `${b}/vms`, label: t('nav.vms'), icon: 'IconMonitor' },
       { group: t('nav.tenantPortal') },
       { path: `${b}/tenants`, label: t('nav.tenants'), icon: 'IconOfficeBuilding' },
@@ -90,6 +92,7 @@ const menu = computed(() => {
     { path: `${b}/vms`, label: t('nav.vms'), icon: 'IconMonitor' },
   ]
   if (auth.can('network.view')) items.push({ path: `${b}/networks`, label: t('nav.networks'), icon: 'IconConnection' })
+  if (auth.can('router.view')) items.push({ path: `${b}/edge`, label: t('nav.edge'), icon: 'IconPosition' })
   if (auth.can('iso.view')) items.push({ path: `${b}/isos`, label: t('nav.isos'), icon: 'IconFiles' })
   if (auth.can('user.view')) items.push({ path: `${b}/users`, label: t('nav.users'), icon: 'IconUser' })
   items.push({ path: `${b}/tasks`, label: t('nav.tasks'), icon: 'IconList' })

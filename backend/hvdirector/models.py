@@ -281,6 +281,8 @@ class VM(Base):
     cluster_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("clusters.id", ondelete="RESTRICT"), nullable=False)
     host_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("hosts.id", ondelete="SET NULL"))
     name: Mapped[str] = mapped_column(String(64), nullable=False)
+    # "vm" = tenant workload, "router" = virtual router (edge) VM managed by HV Director
+    kind: Mapped[str] = mapped_column(String(16), default="vm", server_default="vm", nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     hv_name: Mapped[str] = mapped_column(String(128), nullable=False)
     hv_id: Mapped[str | None] = mapped_column(String(36))
@@ -503,3 +505,180 @@ class Event(Base):
     ip: Mapped[str] = mapped_column(String(64), default="", nullable=False)
 
     __table_args__ = (Index("ix_events_tenant_ts", "tenant_id", "ts"), Index("ix_events_ts", "ts"))
+
+
+# ---------------------------------------------------------------------------
+# Virtual routers (simplified Cloud Director Edge)
+# ---------------------------------------------------------------------------
+
+
+class ExternalNetwork(Base):
+    """Provider network outside the tenants: WAN uplink segment or OOB management segment."""
+
+    __tablename__ = "external_networks"
+
+    id: Mapped[uuid.UUID] = _pk()
+    name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    purpose: Mapped[str] = mapped_column(String(8), nullable=False)  # wan | mgmt
+    vlan_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    cidr: Mapped[str] = mapped_column(String(64), nullable=False)
+    gateway: Mapped[str | None] = mapped_column(String(64))
+    dns: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    vswitch_name: Mapped[str] = mapped_column(String(128), default="", nullable=False)  # "" = cluster switch
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[dt.datetime] = _created()
+
+    __table_args__ = (
+        CheckConstraint("purpose in ('wan','mgmt')", name="ck_extnet_purpose"),
+        CheckConstraint("vlan_id between 1 and 4094", name="ck_extnet_vlan"),
+    )
+
+
+class ExternalIp(Base):
+    """An address of an external network allocated to a tenant (WAN IP or router management IP)."""
+
+    __tablename__ = "external_ips"
+
+    id: Mapped[uuid.UUID] = _pk()
+    network_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("external_networks.id", ondelete="RESTRICT"),
+                                                  nullable=False)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    address: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[dt.datetime] = _created()
+
+    network: Mapped[ExternalNetwork] = relationship()
+
+    __table_args__ = (Index("ux_external_ips_addr", "network_id", "address", unique=True),)
+
+
+class Router(Base):
+    """Tenant virtual router: Debian 13 VM, tenant side in a VRF, management in the global table."""
+
+    __tablename__ = "routers"
+
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id", ondelete="RESTRICT"), unique=True,
+                                                 nullable=False)
+    vm_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("vms.id", ondelete="SET NULL"))
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="deploying", nullable=False)
+    status_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    mgmt_ip_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("external_ips.id", ondelete="RESTRICT"), nullable=False)
+    storage_class_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("storage_classes.id", ondelete="RESTRICT"),
+                                                        nullable=False)
+    mgmt_mac: Mapped[str] = mapped_column(String(17), nullable=False)
+    wan_mac: Mapped[str] = mapped_column(String(17), nullable=False)
+    lan_mac: Mapped[str] = mapped_column(String(17), nullable=False)
+    firewall_stateful: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    firewall_default_action: Mapped[str] = mapped_column(String(8), default="drop", nullable=False)
+    firewall_log_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    config_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    applied_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_applied_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    root_password_enc: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    host_key_enc: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    host_key_pub: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    install_iso_file: Mapped[str | None] = mapped_column(String(320))
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[dt.datetime] = _created()
+
+    tenant: Mapped[Tenant] = relationship()
+    vm: Mapped[VM | None] = relationship()
+    mgmt_ip: Mapped[ExternalIp] = relationship()
+    storage_class: Mapped[StorageClass] = relationship()
+    networks: Mapped[list[RouterNetwork]] = relationship(back_populates="router", cascade="all, delete-orphan")
+    firewall_rules: Mapped[list[FirewallRule]] = relationship(back_populates="router", cascade="all, delete-orphan",
+                                                              order_by="FirewallRule.position")
+    nat_rules: Mapped[list[NatRule]] = relationship(back_populates="router", cascade="all, delete-orphan",
+                                                    order_by="NatRule.position")
+
+    __table_args__ = (
+        CheckConstraint("firewall_default_action in ('drop','accept')", name="ck_router_default_action"),
+    )
+
+
+class RouterNetwork(Base):
+    """Tenant network connected to the router: a VLAN SVI on the router OS (gateway address)."""
+
+    __tablename__ = "router_networks"
+
+    router_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("routers.id", ondelete="CASCADE"), primary_key=True)
+    network_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("networks.id", ondelete="RESTRICT"), primary_key=True)
+
+    router: Mapped[Router] = relationship(back_populates="networks")
+    network: Mapped[Network] = relationship()
+
+
+class IpSet(Base):
+    """Named list of IPv4 addresses / CIDRs / ranges used in firewall rules."""
+
+    __tablename__ = "ip_sets"
+
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    entries: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    created_at: Mapped[dt.datetime] = _created()
+
+    __table_args__ = (Index("ux_ip_sets_tenant_name", "tenant_id", func.lower(text("name")), unique=True),)
+
+
+class FirewallRule(Base):
+    __tablename__ = "firewall_rules"
+
+    id: Mapped[uuid.UUID] = _pk()
+    router_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("routers.id", ondelete="CASCADE"), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    action: Mapped[str] = mapped_column(String(8), default="allow", nullable=False)  # allow | drop | reject
+    protocol: Mapped[str] = mapped_column(String(8), default="any", nullable=False)  # any|tcp|udp|tcp_udp|icmp
+    # [{"type": "cidr"|"ipset"|"network", "value": "..."}]; empty list = any
+    sources: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list, nullable=False)
+    destinations: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list, nullable=False)
+    src_ports: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    dst_ports: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    log: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[dt.datetime] = _created()
+
+    router: Mapped[Router] = relationship(back_populates="firewall_rules")
+
+    __table_args__ = (
+        CheckConstraint("action in ('allow','drop','reject')", name="ck_fw_action"),
+        CheckConstraint("protocol in ('any','tcp','udp','tcp_udp','icmp')", name="ck_fw_protocol"),
+    )
+
+
+class NatRule(Base):
+    __tablename__ = "nat_rules"
+
+    id: Mapped[uuid.UUID] = _pk()
+    router_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("routers.id", ondelete="CASCADE"), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    kind: Mapped[str] = mapped_column(String(8), nullable=False)  # snat | dnat
+    external_ip_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("external_ips.id", ondelete="RESTRICT"),
+                                                      nullable=False)
+    # SNAT: internal source (IP/CIDR); DNAT: internal destination host (IP)
+    internal_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    protocol: Mapped[str] = mapped_column(String(8), default="any", nullable=False)  # any|tcp|udp|tcp_udp
+    external_port: Mapped[str] = mapped_column(String(32), default="", nullable=False)  # DNAT: port or range
+    internal_port: Mapped[str] = mapped_column(String(16), default="", nullable=False)  # DNAT: translated port
+    # Optional peer filter: SNAT -> destination, DNAT -> source (IP/CIDR)
+    match_address: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    log: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[dt.datetime] = _created()
+
+    router: Mapped[Router] = relationship(back_populates="nat_rules")
+    external_ip: Mapped[ExternalIp] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("kind in ('snat','dnat')", name="ck_nat_kind"),
+        CheckConstraint("protocol in ('any','tcp','udp','tcp_udp')", name="ck_nat_protocol"),
+    )

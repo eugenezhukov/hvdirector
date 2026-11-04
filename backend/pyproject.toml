@@ -18,6 +18,7 @@ dependencies = [
     "cryptography>=42",
     "pypsrp[credssp]>=0.8.1",
     "smbprotocol>=1.13",
+    "paramiko>=3.4",
 ]
 
 [project.optional-dependencies]

@@ -26,6 +26,7 @@ import { ElMessage } from 'element-plus'
 import { api } from '../api'
 import { errorText, currentLocale } from '../i18n'
 
+const props = defineProps({ provider: { type: Boolean, default: false } })
 const { t } = useI18n()
 const visible = ref(false)
 const src = ref('')
@@ -33,7 +34,7 @@ const vmName = ref('')
 const vmId = ref('')
 
 async function ticketUrl(id, name) {
-  const res = await api.post(`/api/tenant/vms/${id}/console`)
+  const res = await api.post(props.provider ? `/api/provider/vms/${id}/console` : `/api/tenant/vms/${id}/console`)
   const q = new URLSearchParams({ ticket: res.ticket, name, lang: currentLocale.value })
   return `/console.html?${q.toString()}`
 }

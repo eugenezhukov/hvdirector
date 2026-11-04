@@ -16,8 +16,8 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..errors import AppError, Conflict, NotFound
 from ..hyperv import Endpoint, HyperVError, get_driver
-from ..models import (VM, Cluster, Datastore, Host, Iso, Network, StorageClass, Task, Tenant, TenantStorageQuota,
-                      TenantVlan, User, VMDisk)
+from ..models import (VM, Cluster, Datastore, ExternalNetwork, Host, Iso, Network, Router, StorageClass, Task,
+                      Tenant, TenantStorageQuota, TenantVlan, User, VMDisk)
 from ..security import encrypt_secret
 from ..services import isos as iso_svc
 from ..services import users as user_svc
@@ -25,7 +25,7 @@ from ..services.audit import log_event
 from ..services.inventory import discovery_summary
 from ..services.quotas import quota_report
 from ..services.rbac import Principal
-from ..services.settings import DEFAULTS, get_setting, public_setting, set_setting
+from ..services.settings import DEFAULTS, READONLY_FIELDS, get_setting, public_setting, set_setting
 from ..services.taskqueue import enqueue, task_to_dict
 from ..utils import SLUG_RE, VlanParseError, parse_vlan_ranges
 from .deps import provider_admin
@@ -518,6 +518,10 @@ def _apply_vlans(db: Session, tenant: Tenant, spec: str) -> None:
     except VlanParseError as exc:
         raise AppError("invalid_vlans", str(exc)) from exc
     if wanted:
+        external = db.scalars(select(ExternalNetwork).where(ExternalNetwork.vlan_id.in_(wanted))).all()
+        if external:
+            raise Conflict("vlan_reserved_external", "VLANs are used by external networks",
+                           vlans=", ".join(f"{n.vlan_id} ({n.name})" for n in external))
         taken = db.scalars(select(TenantVlan).where(TenantVlan.vlan_id.in_(wanted),
                                                     TenantVlan.tenant_id != tenant.id)).all()
         if taken:
@@ -643,6 +647,8 @@ def update_tenant(tenant_id: uuid.UUID, body: TenantUpdateIn, p: Principal = Dep
 @router.delete("/tenants/{tenant_id}")
 def delete_tenant(tenant_id: uuid.UUID, p: Principal = Depends(provider_admin), db: Session = Depends(get_db)) -> dict:
     t = _get_tenant(db, tenant_id)
+    if db.scalar(select(Router).where(Router.tenant_id == t.id)):
+        raise Conflict("tenant_has_router", "Delete the organization router first")
     if db.scalar(select(func.count(VM.id)).where(VM.tenant_id == t.id)):
         raise Conflict("tenant_has_vms", "Delete all tenant VMs first")
     store = iso_svc.store(db)
@@ -854,7 +860,7 @@ def get_settings(p: Principal = Depends(provider_admin), db: Session = Depends(g
 def put_setting(key: str, body: dict, p: Principal = Depends(provider_admin), db: Session = Depends(get_db)) -> dict:
     if key not in DEFAULTS:
         raise NotFound("setting")
-    allowed = set(DEFAULTS[key]) - {"password_enc"}
+    allowed = set(DEFAULTS[key]) - {"password_enc"} - READONLY_FIELDS.get(key, set())
     value = {k: v for k, v in body.items() if k in allowed}
     if key == "iso_share":
         if "password" in body and body["password"]:
@@ -867,11 +873,34 @@ def put_setting(key: str, body: dict, p: Principal = Depends(provider_admin), db
         value["port"] = int(value["port"])
     if key == "sync" and "interval_s" in value:
         value["interval_s"] = max(0, int(value["interval_s"]))
+    if key == "router":
+        _validate_router_setting(db, value)
     merged = set_setting(db, key, value)
     log_event(db, "settings.updated", user=p.user, target_type="settings", target_name=key, ip=p.ip,
               details={k: v for k, v in value.items() if "password" not in k})
     db.commit()
     return public_setting(key, merged)
+
+
+def _validate_router_setting(db: Session, value: dict) -> None:
+    from ..services import netutil
+
+    if value.get("iso_id"):
+        iso = db.get(Iso, uuid.UUID(str(value["iso_id"])))
+        if iso is None or iso.tenant_id is not None or iso.status != "ready":
+            raise AppError("router_iso_invalid", "Select a ready ISO from the public catalog")
+    if value.get("mgmt_allowed"):
+        netutil.normalize_addresses([x for x in re.split(r"[,;\s]+", str(value["mgmt_allowed"])) if x])
+    for field, lo, hi in (("vcpu", 1, 64), ("memory_mb", 512, 65536), ("disk_gb", 4, 1024),
+                          ("install_timeout_min", 10, 600)):
+        if field in value:
+            v = int(value[field])
+            if not lo <= v <= hi:
+                raise AppError("invalid_value", f"{field} must be between {lo} and {hi}", field=field)
+            value[field] = v
+    for field in ("mirror_host", "mirror_dir", "http_proxy", "timezone"):
+        if any(c in str(value.get(field) or "") for c in " \t\n\"'\\$`;|&"):
+            raise AppError("invalid_installer_value", f"Unsupported characters in {field}", field=field)
 
 
 @router.post("/settings/iso_share/test")

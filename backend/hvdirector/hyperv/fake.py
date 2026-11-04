@@ -281,7 +281,9 @@ class FakeDriver(HyperVDriver):
                     raise HyperVError(f"VM '{spec['name']}' already exists on {host['name']}", "VM_EXISTS",
                                       host["name"])
             vm_id = str(uuid.uuid4()).upper()
-            nics = [{"name": n["name"], "mac": _mac(), "switch": n.get("switch"), "vlan": n.get("vlan")}
+            nics = [{"name": n["name"], "mac": (n.get("mac") or _mac()).upper(), "switch": n.get("switch"),
+                     "vlan": n.get("vlan"), "mode": n.get("mode") or "access", "allowed": n.get("allowed"),
+                     "connected": n.get("connected") is not False and bool(n.get("switch"))}
                     for n in spec.get("nics", [])]
             vm = {
                 "id": vm_id,
@@ -298,6 +300,7 @@ class FakeDriver(HyperVDriver):
                 "group": None,
                 "clustered": False,
                 "config_path": spec["path"] + "\\" + spec["name"],
+                "boot_disk_first": bool(spec.get("boot_disk_first")),
             }
             st["vms"][vm_id] = vm
             return {"id": vm_id, "name": vm["name"], "state": "Off", "config_path": vm["config_path"],
@@ -417,14 +420,23 @@ class FakeDriver(HyperVDriver):
             nic_out = []
             for n in changes.get("nics") or []:
                 if n["op"] == "add":
-                    nic = {"name": n["name"], "mac": _mac(), "switch": n.get("switch"), "vlan": n.get("vlan")}
+                    nic = {"name": n["name"], "mac": (n.get("mac") or _mac()).upper(), "switch": n.get("switch"),
+                           "vlan": n.get("vlan"), "mode": n.get("mode") or "access", "allowed": n.get("allowed"),
+                           "connected": n.get("connected") is not False and bool(n.get("switch"))}
                     vm["nics"].append(nic)
                     nic_out.append({"name": nic["name"], "mac": nic["mac"]})
                 elif n["op"] == "set":
+                    found = False
                     for nic in vm["nics"]:
                         if nic["name"] == n["name"]:
+                            found = True
                             nic["switch"] = n.get("switch")
                             nic["vlan"] = n.get("vlan")
+                            nic["mode"] = n.get("mode") or "access"
+                            nic["allowed"] = n.get("allowed")
+                            nic["connected"] = n.get("connected") is not False and bool(n.get("switch"))
+                    if not found:
+                        raise HyperVError(f"Network adapter {n['name']} not found", "PS_ERROR", host["name"])
                 elif n["op"] == "remove":
                     vm["nics"] = [x for x in vm["nics"] if x["name"] != n["name"]]
             res = self._summary(vm)
