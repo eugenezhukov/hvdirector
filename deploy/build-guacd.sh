@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Build and install guacd (Apache Guacamole server) 1.6.0 with RDP support on Debian 13
-# (also Ubuntu 24.04+: same package names, libjpeg-dev pulls the distribution libjpeg-turbo).
+# Build and install guacd (Apache Guacamole server) 1.6.0 with RDP support on Debian 13.
 #
 # Debian 13 (trixie) has no guacd package and ships FreeRDP 3.  guacamole-server 1.6.0
 # supports FreeRDP 3, but its configure checks and sources are compiled with -Werror,
